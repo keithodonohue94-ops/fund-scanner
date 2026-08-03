@@ -91,6 +91,9 @@ _session: requests.Session | None = None
 _crumb:   str | None = None
 
 
+_CRUMB_RE = re.compile(r'"crumb"\s*:\s*"([^"]{5,20})"')
+
+
 def _init_session() -> bool:
     """
     Establish a Yahoo Finance session with valid cookie + crumb.
@@ -105,25 +108,40 @@ def _init_session() -> bool:
         r1 = sess.get("https://finance.yahoo.com/", timeout=15)
         logger.info("Yahoo homepage: %d", r1.status_code)
 
-        # Step 2: fetch crumb
-        sess.headers.update({"Accept": "application/json"})
-        r2 = sess.get(
-            "https://query1.finance.yahoo.com/v1/test/getcrumb",
-            timeout=10,
-        )
-        if r2.status_code != 200 or not r2.text.strip():
-            # Fallback: try query2
-            r2 = sess.get(
-                "https://query2.finance.yahoo.com/v1/test/getcrumb",
-                timeout=10,
-            )
+        # Step 2a: try the getcrumb endpoint first
+        crumb = None
+        for base in ("https://query1.finance.yahoo.com",
+                     "https://query2.finance.yahoo.com"):
+            try:
+                r2 = sess.get(f"{base}/v1/test/getcrumb", timeout=10)
+                candidate = r2.text.strip().strip('"')
+                if r2.status_code == 200 and 5 <= len(candidate) <= 20:
+                    crumb = candidate
+                    break
+            except Exception:
+                pass
 
-        crumb = r2.text.strip().strip('"')
-        if not crumb or len(crumb) > 50:
-            logger.warning("Bad crumb: %r", crumb)
+        # Step 2b: fall back to extracting crumb from the page HTML
+        if not crumb:
+            logger.info("getcrumb blocked — extracting crumb from page HTML")
+            for page_url in (
+                "https://finance.yahoo.com/quote/AAPL/",
+                "https://finance.yahoo.com/",
+            ):
+                try:
+                    rp = sess.get(page_url, timeout=15)
+                    m  = _CRUMB_RE.search(rp.text)
+                    if m:
+                        crumb = m.group(1).encode().decode("unicode_escape")
+                        logger.info("Extracted crumb from HTML: %r", crumb)
+                        break
+                except Exception:
+                    pass
+
+        if not crumb:
+            logger.warning("Could not obtain Yahoo Finance crumb")
             return False
 
-        logger.info("Got crumb: %r", crumb)
         sess.headers.update(API_HEADERS)
         _session = sess
         _crumb   = crumb
