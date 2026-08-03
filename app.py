@@ -77,15 +77,17 @@ def _run_scan(universe_key: str):
 
 def _background_scheduler():
     """
-    On startup: scan all universes sequentially (smallest first).
-    Then repeat every 24 hours so cached data stays fresh.
+    On startup: scan only portfolio (to avoid hammering Yahoo rate limits).
+    Then repeat every 24 hours. Other universes are scanned on-demand.
     """
+    time.sleep(5)  # let gunicorn finish booting
+    _run_scan("portfolio")
+    logger.info("Startup scan done. Sleeping 24 hours.")
     while True:
+        time.sleep(86_400)   # 24 hours
         for ukey in SCAN_ORDER:
             _run_scan(ukey)
-            time.sleep(10)          # brief pause between universes
-        logger.info("Full cycle done. Sleeping 24 hours.")
-        time.sleep(86_400)          # 24 hours
+            time.sleep(30)   # 30s between universes on the nightly refresh
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
@@ -170,7 +172,8 @@ def poll():
     with _cache_lock:
         data = CACHE.get(universe)
     scanning = universe in SCANNING
-    if data:
+    # Don't serve stale empty results while a fresh scan is running
+    if data and (data["count"] > 0 or not scanning):
         return jsonify({
             "ready":      True,
             "scanning":   scanning,
