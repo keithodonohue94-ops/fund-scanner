@@ -192,11 +192,11 @@ def _now():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    # Start background scheduler in a daemon thread
-    bg = threading.Thread(target=_background_scheduler, daemon=True)
-    bg.start()
+# Start background scheduler when module loads (works with gunicorn too)
+_bg_thread = threading.Thread(target=_background_scheduler, daemon=True)
+_bg_thread.start()
 
+if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port)
