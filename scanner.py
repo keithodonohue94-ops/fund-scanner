@@ -2,8 +2,10 @@
 fund-scanner/scanner.py
 Yahoo Finance fundamental data fetcher.
 Uses a proper cookie+crumb auth flow to avoid 401/429 errors from cloud IPs.
+QoQ margin deltas sourced from Financial Modeling Prep (FMP) quarterly income statements.
 """
 
+import os
 import re
 import time
 import logging
@@ -81,8 +83,7 @@ API_HEADERS = {
 
 QUOTE_URL = (
     "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-    "?modules=defaultKeyStatistics,financialData,summaryDetail,"
-    "incomeStatementHistoryQuarterly,price"
+    "?modules=defaultKeyStatistics,financialData,summaryDetail,price"
     "&crumb={crumb}"
 )
 
@@ -160,6 +161,15 @@ def _ensure_session() -> bool:
     return _init_session()
 
 
+# ── FMP config ────────────────────────────────────────────────────────────────
+
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+FMP_INCOME_URL = (
+    "https://financialmodelingprep.com/api/v3/income-statement/{symbol}"
+    "?period=quarter&limit=3&apikey={apikey}"
+)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe_float(val):
@@ -170,6 +180,51 @@ def _safe_float(val):
         return f
     except (TypeError, ValueError):
         return None
+
+
+def _get_quarterly_deltas_fmp(symbol: str) -> tuple:
+    """
+    Fetch last 2 quarterly income statements from FMP and compute
+    QoQ operating margin delta and gross margin delta.
+    Returns (op_delta, gm_delta) as fractions (e.g. 0.02 = +2pp).
+    Returns (None, None) on any error.
+    """
+    if not FMP_API_KEY:
+        return None, None
+    try:
+        url  = FMP_INCOME_URL.format(symbol=symbol, apikey=FMP_API_KEY)
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            logger.warning("FMP %s: HTTP %d", symbol, resp.status_code)
+            return None, None
+        stmts = resp.json()
+        if not stmts or len(stmts) < 2:
+            return None, None
+
+        s0, s1 = stmts[0], stmts[1]  # most recent, then prior quarter
+
+        r0 = _safe_float(s0.get("revenue"))
+        r1 = _safe_float(s1.get("revenue"))
+        if not r0 or not r1:
+            return None, None
+
+        gp0 = _safe_float(s0.get("grossProfit"))
+        gp1 = _safe_float(s1.get("grossProfit"))
+        gm_delta = (gp0 / r0 - gp1 / r1) if gp0 is not None and gp1 is not None else None
+
+        oi0 = _safe_float(s0.get("operatingIncome"))
+        oi1 = _safe_float(s1.get("operatingIncome"))
+        op_delta = (oi0 / r0 - oi1 / r1) if oi0 is not None and oi1 is not None else None
+
+        logger.debug(
+            "FMP QoQ %s: r0=%s r1=%s gp0=%s gp1=%s oi0=%s oi1=%s → gm_Δ=%s op_Δ=%s",
+            symbol, r0, r1, gp0, gp1, oi0, oi1, gm_delta, op_delta,
+        )
+        return op_delta, gm_delta
+
+    except Exception as exc:
+        logger.warning("FMP quarterly error %s: %s", symbol, exc)
+        return None, None
 
 
 def _get_quarterly_deltas(quarterly_stmts: list) -> tuple:
@@ -198,22 +253,22 @@ def _get_quarterly_deltas(quarterly_stmts: list) -> tuple:
         if not r0 or not r1:
             return None, None
 
-        # grossProfit: try direct field first; if zero/missing, compute from revenue - COGS
+        # grossProfit: direct field or compute from revenue - COGS (only if COGS is non-zero)
         def get_gross_profit(stmt, rev):
             gp = raw(stmt, "grossProfit")
             if gp:  # non-None, non-zero
                 return gp
             cogs = raw(stmt, "costOfRevenue")
-            if cogs is not None and rev:
+            if cogs:  # only use COGS fallback if COGS is also non-zero
                 return rev - cogs
-            return gp  # may be None or 0.0
+            return None  # Yahoo returned zeros — can't compute
 
         gp0 = get_gross_profit(s0, r0)
         gp1 = get_gross_profit(s1, r1)
         gm_delta = (gp0 / r0 - gp1 / r1) if gp0 is not None and gp1 is not None else None
 
         # operatingIncome: prefer operatingIncome, fall back to ebit
-        # Use first_nonzero to skip zero placeholders Yahoo sometimes returns
+        # first_nonzero skips zero placeholders Yahoo sometimes returns
         oi0 = first_nonzero(s0, "operatingIncome", "ebit")
         oi1 = first_nonzero(s1, "operatingIncome", "ebit")
         op_delta = (oi0 / r0 - oi1 / r1) if oi0 is not None and oi1 is not None else None
@@ -281,8 +336,8 @@ def scan_ticker(symbol: str, retries: int = 2) -> dict:
     chg_raw = g("price", "regularMarketChangePercent")
     chg_pct = round(chg_raw * 100, 2) if chg_raw is not None else None
 
-    quarterly = (r.get("incomeStatementHistoryQuarterly") or {}).get("incomeStatementHistory") or []
-    op_delta, gm_delta = _get_quarterly_deltas(quarterly)
+    # Use FMP for quarterly P&L (Yahoo returns zeros for grossProfit/operatingIncome)
+    op_delta, gm_delta = _get_quarterly_deltas_fmp(symbol)
 
     return {
         "ticker":       symbol,
