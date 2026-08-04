@@ -97,6 +97,21 @@ def health():
     return jsonify({"status": "ok", "timestamp": _now()})
 
 
+@app.route("/api/debug")
+def debug_ticker():
+    """Return raw quarterly income statement data for one ticker."""
+    from scanner import _ensure_session, _session, _crumb, QUOTE_URL
+    symbol = request.args.get("symbol", "ALAB")
+    _ensure_session()
+    import scanner as sc
+    url = QUOTE_URL.format(symbol=symbol, crumb=sc._crumb)
+    resp = sc._session.get(url, timeout=15)
+    data = resp.json()
+    result = (data.get("quoteSummary") or {}).get("result") or [{}]
+    quarterly = (result[0].get("incomeStatementHistoryQuarterly") or {}).get("incomeStatementHistory") or []
+    return jsonify({"symbol": symbol, "quarterly_count": len(quarterly), "statements": quarterly[:2]})
+
+
 @app.route("/api/stats")
 def stats():
     with _cache_lock:
