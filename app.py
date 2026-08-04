@@ -100,16 +100,22 @@ def health():
 @app.route("/api/debug")
 def debug_ticker():
     """Return raw quarterly income statement data for one ticker."""
-    from scanner import _ensure_session, _session, _crumb, QUOTE_URL
-    symbol = request.args.get("symbol", "ALAB")
-    _ensure_session()
     import scanner as sc
-    url = QUOTE_URL.format(symbol=symbol, crumb=sc._crumb)
-    resp = sc._session.get(url, timeout=15)
-    data = resp.json()
-    result = (data.get("quoteSummary") or {}).get("result") or [{}]
-    quarterly = (result[0].get("incomeStatementHistoryQuarterly") or {}).get("incomeStatementHistory") or []
-    return jsonify({"symbol": symbol, "quarterly_count": len(quarterly), "statements": quarterly[:2]})
+    symbol = request.args.get("symbol", "ALAB")
+    try:
+        sc._ensure_session()
+        url = sc.QUOTE_URL.format(symbol=symbol, crumb=sc._crumb)
+        resp = sc._session.get(url, timeout=15)
+        data = resp.json()
+        result = (data.get("quoteSummary") or {}).get("result") or [{}]
+        quarterly = (result[0].get("incomeStatementHistoryQuarterly") or {}).get("incomeStatementHistory") or []
+        # Return just the keys and first values so we can see the structure
+        sample = []
+        for stmt in quarterly[:2]:
+            sample.append({k: v for k, v in stmt.items()})
+        return jsonify({"symbol": symbol, "count": len(quarterly), "statements": sample})
+    except Exception as e:
+        return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
 
 @app.route("/api/stats")
