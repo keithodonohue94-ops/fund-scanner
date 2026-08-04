@@ -183,6 +183,14 @@ def _get_quarterly_deltas(quarterly_stmts: list) -> tuple:
                 return _safe_float(v.get("raw"))
             return _safe_float(v)
 
+        def first_nonzero(stmt, *keys):
+            """Return first non-None, non-zero value across keys."""
+            for k in keys:
+                v = raw(stmt, k)
+                if v is not None and v != 0.0:
+                    return v
+            return None
+
         s0, s1 = quarterly_stmts[0], quarterly_stmts[1]
 
         r0 = raw(s0, "totalRevenue")
@@ -190,13 +198,27 @@ def _get_quarterly_deltas(quarterly_stmts: list) -> tuple:
         if not r0 or not r1:
             return None, None
 
-        gp0, gp1 = raw(s0, "grossProfit"), raw(s1, "grossProfit")
-        gm_delta  = (gp0 / r0 - gp1 / r1) if gp0 is not None and gp1 is not None else None
+        # grossProfit: try direct field first; if zero/missing, compute from revenue - COGS
+        def get_gross_profit(stmt, rev):
+            gp = raw(stmt, "grossProfit")
+            if gp:  # non-None, non-zero
+                return gp
+            cogs = raw(stmt, "costOfRevenue")
+            if cogs is not None and rev:
+                return rev - cogs
+            return gp  # may be None or 0.0
 
-        oi0 = raw(s0, "operatingIncome") or raw(s0, "ebit")
-        oi1 = raw(s1, "operatingIncome") or raw(s1, "ebit")
+        gp0 = get_gross_profit(s0, r0)
+        gp1 = get_gross_profit(s1, r1)
+        gm_delta = (gp0 / r0 - gp1 / r1) if gp0 is not None and gp1 is not None else None
+
+        # operatingIncome: prefer operatingIncome, fall back to ebit
+        # Use first_nonzero to skip zero placeholders Yahoo sometimes returns
+        oi0 = first_nonzero(s0, "operatingIncome", "ebit")
+        oi1 = first_nonzero(s1, "operatingIncome", "ebit")
         op_delta = (oi0 / r0 - oi1 / r1) if oi0 is not None and oi1 is not None else None
 
+        logger.debug("QoQ r0=%s r1=%s gp0=%s gp1=%s oi0=%s oi1=%s", r0, r1, gp0, gp1, oi0, oi1)
         return op_delta, gm_delta
     except Exception as exc:
         logger.debug("quarterly delta error: %s", exc)
