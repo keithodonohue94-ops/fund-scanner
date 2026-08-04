@@ -165,8 +165,8 @@ def _ensure_session() -> bool:
 
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 FMP_INCOME_URL = (
-    "https://financialmodelingprep.com/api/v3/income-statement/{symbol}"
-    "?period=quarter&limit=3&apikey={apikey}"
+    "https://financialmodelingprep.com/stable/income-statement"
+    "?symbol={symbol}&period=quarter&limit=3&apikey={apikey}"
 )
 
 
@@ -192,7 +192,7 @@ def _get_quarterly_deltas_fmp(symbol: str) -> tuple:
     if not FMP_API_KEY:
         return None, None
     try:
-        url  = FMP_INCOME_URL.format(symbol=symbol, apikey=FMP_API_KEY)
+        url  = FMP_INCOME_URL.format(symbol=symbol.upper(), apikey=FMP_API_KEY)
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
             logger.warning("FMP %s: HTTP %d", symbol, resp.status_code)
