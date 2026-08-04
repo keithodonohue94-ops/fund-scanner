@@ -3,7 +3,7 @@ services:
     name: fund-scanner
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 2 --timeout 120
+    startCommand: gunicorn app:app --workers 1 --timeout 180
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
