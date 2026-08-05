@@ -12,6 +12,9 @@ Endpoints:
 import threading
 import time
 import logging
+import hmac
+import hashlib
+import os
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
@@ -27,7 +30,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)   # allow the dashboard (any origin) to call this API
+CORS(app)
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+_OSPREY_SECRET   = os.environ.get("OSPREY_SECRET",   "osprey-secret-change-me")
+_OSPREY_PASSWORD = os.environ.get("OSPREY_PASSWORD",  "changeme")
+
+def _make_token(password: str) -> str:
+    return hmac.new(_OSPREY_SECRET.encode(), password.encode(), hashlib.sha256).hexdigest()
+
+_VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
+
+@app.before_request
+def check_auth():
+    if request.method == "OPTIONS":
+        return None
+    if request.path in ("/api/health",):
+        return None
+    if request.path.startswith("/api/"):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Unauthorized"}), 401
+        if not hmac.compare_digest(auth[7:], _VALID_TOKEN):
+            return jsonify({"error": "Unauthorized"}), 401
+    return None
 
 # ── In-memory cache ───────────────────────────────────────────────────────────
 # Structure:  CACHE[universe_key] = {
@@ -175,6 +201,10 @@ def trigger_scan():
 
     if universe in SCANNING:
         return jsonify({"status": "already_scanning", "universe": universe})
+
+    # Clear stale cache so poll waits for fresh results instead of returning old data
+    with _cache_lock:
+        CACHE.pop(universe, None)
 
     t = threading.Thread(target=_run_scan, args=(universe,), daemon=True)
     t.start()
