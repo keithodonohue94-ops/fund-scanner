@@ -113,12 +113,17 @@ def _fetch_quote(symbol: str) -> dict:
         q = data
     else:
         return {}
-    chg_raw = _safe_float(q.get("changesPercentage"))
+    # Debug first ticker to see field names
+    if symbol.upper() == "ALAB":
+        logger.info("QUOTE FIELDS for %s: %s", symbol, list(q.keys()))
+        logger.info("QUOTE SAMPLE: %s", {k: q[k] for k in list(q.keys())[:15]})
+    chg_raw = _safe_float(q.get("changesPercentage") or q.get("changePercent") or q.get("change_percent"))
+    pe      = _safe_float(q.get("pe") or q.get("priceEarningsRatio") or q.get("peRatio"))
     return {
         "price":   _safe_float(q.get("price")),
         "chg_pct": round(chg_raw, 2) if chg_raw is not None else None,
-        "mkt_cap": _safe_float(q.get("marketCap")),
-        "pe":      _safe_float(q.get("pe")),
+        "mkt_cap": _safe_float(q.get("marketCap") or q.get("market_cap")),
+        "pe":      pe,
         "eps":     _safe_float(q.get("eps")),
     }
 
@@ -152,13 +157,17 @@ def _fetch_ratios(symbol: str) -> dict:
         r = data
     else:
         return {}
+    # Debug first ticker to see field names
+    if symbol.upper() == "ALAB":
+        logger.info("RATIOS FIELDS for %s: %s", symbol, list(r.keys()))
+        logger.info("RATIOS SAMPLE: %s", {k: r[k] for k in list(r.keys())[:20]})
     return {
-        "peg":          _safe_float(r.get("priceEarningsToGrowthRatioTTM")),
+        "peg":          _safe_float(r.get("priceEarningsToGrowthRatioTTM") or r.get("pegRatioTTM")),
         "ps":           _safe_float(r.get("priceToSalesRatioTTM")),
-        "fwd_pe":       _safe_float(r.get("priceToEarningsRatioTTM")),
-        "rev_growth":   _safe_float(r.get("revenueGrowthTTM")),
-        "gross_margin": _safe_float(r.get("grossProfitMarginTTM")),
-        "op_margin":    _safe_float(r.get("operatingProfitMarginTTM")),
+        "fwd_pe":       _safe_float(r.get("priceToEarningsRatioTTM") or r.get("forwardPETTM")),
+        "rev_growth":   _safe_float(r.get("revenueGrowthTTM") or r.get("revenueGrowth")),
+        "gross_margin": _safe_float(r.get("grossProfitMarginTTM") or r.get("grossProfitMargin")),
+        "op_margin":    _safe_float(r.get("operatingProfitMarginTTM") or r.get("operatingProfitMargin")),
     }
 
 
