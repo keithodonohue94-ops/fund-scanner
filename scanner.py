@@ -162,12 +162,12 @@ def _fetch_ratios(symbol: str) -> dict:
         logger.info("RATIOS FIELDS for %s: %s", symbol, list(r.keys()))
         logger.info("RATIOS SAMPLE: %s", {k: r[k] for k in list(r.keys())[:20]})
     return {
-        "peg":          _safe_float(r.get("priceEarningsToGrowthRatioTTM") or r.get("pegRatioTTM")),
+        "pe":           _safe_float(r.get("priceToEarningsRatioTTM")),
+        "peg":          _safe_float(r.get("priceToEarningsGrowthRatioTTM")),
         "ps":           _safe_float(r.get("priceToSalesRatioTTM")),
-        "fwd_pe":       _safe_float(r.get("priceToEarningsRatioTTM") or r.get("forwardPETTM")),
-        "rev_growth":   _safe_float(r.get("revenueGrowthTTM") or r.get("revenueGrowth")),
-        "gross_margin": _safe_float(r.get("grossProfitMarginTTM") or r.get("grossProfitMargin")),
-        "op_margin":    _safe_float(r.get("operatingProfitMarginTTM") or r.get("operatingProfitMargin")),
+        "fwd_pe":       _safe_float(r.get("forwardPriceToEarningsGrowthRatioTTM") or r.get("priceToEarningsRatioTTM")),
+        "gross_margin": _safe_float(r.get("grossProfitMarginTTM")),
+        "op_margin":    _safe_float(r.get("operatingProfitMarginTTM")),
     }
 
 
@@ -186,21 +186,22 @@ def _batch_ratios(tickers: list) -> dict:
     return out
 
 
-def _quarterly_deltas(symbol: str) -> tuple:
+def _quarterly_data(symbol: str) -> tuple:
     """
-    Fetch last 2 quarterly income statements from FMP.
-    Returns (op_delta, gm_delta) as fractions (e.g. 0.02 = +2pp).
+    Fetch last 3 quarterly income statements from FMP.
+    Returns (op_delta, gm_delta, rev_growth) where deltas are pp fractions
+    and rev_growth is YoY % as a fraction (e.g. 0.41 = +41%).
     """
     url  = f"{FMP_STABLE}/income-statement"
-    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "quarter", "limit": 3})
+    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "quarter", "limit": 5})
     if not isinstance(data, list) or len(data) < 2:
-        return None, None
+        return None, None, None
     try:
         s0, s1 = data[0], data[1]
         r0 = _safe_float(s0.get("revenue"))
         r1 = _safe_float(s1.get("revenue"))
         if not r0 or not r1:
-            return None, None
+            return None, None, None
 
         gp0 = _safe_float(s0.get("grossProfit"))
         gp1 = _safe_float(s1.get("grossProfit"))
@@ -210,10 +211,17 @@ def _quarterly_deltas(symbol: str) -> tuple:
         oi1 = _safe_float(s1.get("operatingIncome"))
         op_delta = (oi0 / r0 - oi1 / r1) if oi0 is not None and oi1 is not None else None
 
-        return op_delta, gm_delta
+        # YoY revenue growth: compare most recent quarter vs same quarter last year (index 4)
+        rev_growth = None
+        if len(data) >= 5:
+            r_yoy = _safe_float(data[4].get("revenue"))
+            if r_yoy and r0:
+                rev_growth = (r0 - r_yoy) / abs(r_yoy)
+
+        return op_delta, gm_delta, rev_growth
     except Exception as exc:
-        logger.warning("QoQ delta error %s: %s", symbol, exc)
-        return None, None
+        logger.warning("Quarterly data error %s: %s", symbol, exc)
+        return None, None, None
 
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
@@ -236,17 +244,17 @@ def scan_tickers(tickers: list, delay: float = 0) -> list:
 
     logger.info("Batch quotes: %d, ratios: %d", len(quotes), len(ratios))
 
-    # Step 3: parallel quarterly deltas
+    # Step 3: parallel quarterly data (deltas + rev growth)
     deltas = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_map = {pool.submit(_quarterly_deltas, sym): sym for sym in tickers}
+        future_map = {pool.submit(_quarterly_data, sym): sym for sym in tickers}
         for future in concurrent.futures.as_completed(future_map):
             sym = future_map[future]
             try:
                 deltas[sym] = future.result()
             except Exception as exc:
                 logger.warning("Delta error %s: %s", sym, exc)
-                deltas[sym] = (None, None)
+                deltas[sym] = (None, None, None)
 
     logger.info("Quarterly deltas fetched for %d tickers", len(deltas))
 
@@ -255,7 +263,7 @@ def scan_tickers(tickers: list, delay: float = 0) -> list:
     for sym in tickers:
         q  = quotes.get(sym, {})
         ra = ratios.get(sym, {})
-        op_delta, gm_delta = deltas.get(sym, (None, None))
+        op_delta, gm_delta, rev_growth = deltas.get(sym, (None, None, None))
 
         if not q:
             logger.warning("  %s — no quote data", sym)
@@ -266,11 +274,11 @@ def scan_tickers(tickers: list, delay: float = 0) -> list:
             "price":        q.get("price"),
             "chg_pct":      q.get("chg_pct"),
             "mkt_cap":      q.get("mkt_cap"),
-            "pe":           q.get("pe"),
+            "pe":           ra.get("pe"),          # TTM P/E from ratios
             "fwd_pe":       ra.get("fwd_pe"),
             "peg":          ra.get("peg"),
             "ps":           ra.get("ps"),
-            "rev_growth":   ra.get("rev_growth"),
+            "rev_growth":   rev_growth,             # YoY from income statements
             "gross_margin": ra.get("gross_margin"),
             "op_margin":    ra.get("op_margin"),
             "op_delta":     op_delta,
