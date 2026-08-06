@@ -15,12 +15,13 @@ import logging
 import hmac
 import hashlib
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from scanner import scan_tickers, UNIVERSES
+import db as _db
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -31,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
+
+# Initialise DB (creates tables if missing)
+try:
+    _db.init_db()
+except Exception as _e:
+    logger.error("DB init failed: %s", _e)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 _OSPREY_SECRET   = os.environ.get("OSPREY_SECRET",   "osprey-secret-change-me")
@@ -66,8 +73,12 @@ CACHE: dict = {}
 SCANNING: set = set()          # universes currently being scanned
 _cache_lock = threading.Lock()
 
-# Order to pre-scan on startup / nightly refresh (small → large)
-SCAN_ORDER = ["portfolio", "myportfolio", "smh", "soxx", "ndx100", "sp500"]
+# All universes scanned in the daily 4pm EST run (small → large)
+SCAN_ORDER = [
+    "portfolio", "myportfolio", "aiinfra", "cybersec",
+    "rareearths", "energy", "orbital",
+    "smh", "soxx", "ndx100", "sp500",
+]
 
 
 # ── Scanner logic ─────────────────────────────────────────────────────────────
@@ -95,25 +106,47 @@ def _run_scan(universe_key: str):
                 "universe":   universe_key,
             }
         logger.info("Done: %s — %d results", universe_key, len(results))
+        # Persist to database for historical reporting
+        try:
+            _db.save_snapshot(universe_key, results)
+        except Exception as db_exc:
+            logger.error("DB save error (%s): %s", universe_key, db_exc)
     except Exception as exc:
         logger.error("Scan error (%s): %s", universe_key, exc)
     finally:
         SCANNING.discard(universe_key)
 
 
+def _next_4pm_eastern() -> float:
+    """Return seconds until the next 4:00 PM Eastern time (handles EST/EDT)."""
+    # Eastern is UTC-5 (EST) or UTC-4 (EDT); we approximate with UTC-5 year-round.
+    # Close enough for a market-close scan — worst case it runs at 4pm EST = 5pm EDT.
+    now_utc = datetime.now(timezone.utc)
+    eastern_offset = timedelta(hours=-5)
+    now_et = now_utc + eastern_offset
+    target = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now_et >= target:
+        target += timedelta(days=1)
+    delta = (target - now_et).total_seconds()
+    logger.info("Next 4pm ET scan in %.0f seconds (%.1f hours)", delta, delta / 3600)
+    return delta
+
+
 def _background_scheduler():
     """
-    On startup: scan only portfolio (to avoid hammering Yahoo rate limits).
-    Then repeat every 24 hours. Other universes are scanned on-demand.
+    On startup: scan portfolio to warm the cache.
+    Then at 4:00 PM Eastern every day: scan all universes.
     """
     time.sleep(5)  # let gunicorn finish booting
     _run_scan("portfolio")
-    logger.info("Startup scan done. Sleeping 24 hours.")
+    logger.info("Startup scan done. Waiting for next 4pm ET window.")
     while True:
-        time.sleep(86_400)   # 24 hours
+        time.sleep(_next_4pm_eastern())
+        logger.info("4pm ET — starting full universe scan (%d universes)", len(SCAN_ORDER))
         for ukey in SCAN_ORDER:
             _run_scan(ukey)
-            time.sleep(30)   # 30s between universes on the nightly refresh
+            time.sleep(15)   # 15s between universes to avoid FMP rate limits
+        logger.info("Full universe scan complete.")
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
@@ -233,6 +266,58 @@ def poll():
             "scanned_at": data["scanned_at"],
         })
     return jsonify({"ready": False, "scanning": scanning})
+
+
+# ── History endpoints ─────────────────────────────────────────────────────────
+
+@app.route("/api/history/ticker")
+def history_ticker():
+    """
+    GET /api/history/ticker?ticker=NVDA&universe=soxx&days=90
+    Returns daily snapshots for one ticker.
+    """
+    ticker   = request.args.get("ticker", "").upper()
+    universe = request.args.get("universe") or None
+    days     = min(int(request.args.get("days", 90)), 365)
+    if not ticker:
+        return jsonify({"error": "ticker required"}), 400
+    try:
+        data = _db.get_ticker_history(ticker, universe, days)
+        return jsonify({"ticker": ticker, "universe": universe, "days": days, "data": data})
+    except Exception as exc:
+        logger.error("history_ticker error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/history/universe")
+def history_universe():
+    """
+    GET /api/history/universe?universe=soxx&days=90
+    Returns daily average metrics for a universe over time.
+    """
+    universe = request.args.get("universe", "portfolio")
+    days     = min(int(request.args.get("days", 90)), 365)
+    try:
+        data = _db.get_universe_history(universe, days)
+        return jsonify({"universe": universe, "days": days, "data": data})
+    except Exception as exc:
+        logger.error("history_universe error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/history/tickers")
+def history_tickers():
+    """
+    GET /api/history/tickers?universe=soxx
+    Returns list of tickers that have historical data.
+    """
+    universe = request.args.get("universe") or None
+    try:
+        tickers = _db.get_ticker_list(universe)
+        return jsonify({"universe": universe, "tickers": tickers, "count": len(tickers)})
+    except Exception as exc:
+        logger.error("history_tickers error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
