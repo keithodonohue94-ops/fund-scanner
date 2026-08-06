@@ -1,19 +1,22 @@
 """
 fund-scanner/scanner.py
-Yahoo Finance fundamental data fetcher.
-Uses a proper cookie+crumb auth flow to avoid 401/429 errors from cloud IPs.
-QoQ margin deltas sourced from Financial Modeling Prep (FMP) quarterly income statements.
+FMP-only fundamental data fetcher (Premium plan).
+
+Data flow:
+  - Batch quote    (/stable/quote)               → price, chg%, mkt cap, P/E, fwd P/E, EPS
+  - Batch ratios   (/stable/ratios-ttm)          → PEG, P/S, gross/op margin, rev growth
+  - Per-ticker quarterly income (/stable/income-statement) → QoQ margin deltas
 """
 
 import os
-import re
 import time
 import logging
+import concurrent.futures
 import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Universe definitions (mirrors the frontend) ───────────────────────────────
+# ── Universe definitions ──────────────────────────────────────────────────────
 UNIVERSES = {
     "portfolio": [
         "ALAB","MRVL","CRDO","IREN","APLD","MU","GFS","FLNC",
@@ -59,118 +62,16 @@ UNIVERSES = {
     ],
 }
 
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-}
-
-API_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://finance.yahoo.com/",
-}
-
-QUOTE_URL = (
-    "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-    "?modules=defaultKeyStatistics,financialData,summaryDetail,price"
-    "&crumb={crumb}"
-)
-
-# Module-level session + crumb (shared across all ticker calls in a scan)
-_session: requests.Session | None = None
-_crumb:   str | None = None
-
-
-_CRUMB_RE = re.compile(r'"crumb"\s*:\s*"([^"]{5,20})"')
-
-
-def _init_session() -> bool:
-    """
-    Establish a Yahoo Finance session with valid cookie + crumb.
-    Returns True on success.
-    """
-    global _session, _crumb
-    try:
-        sess = requests.Session()
-        sess.headers.update(BROWSER_HEADERS)
-
-        # Step 1: visit finance.yahoo.com to get consent cookies
-        r1 = sess.get("https://finance.yahoo.com/", timeout=15)
-        logger.info("Yahoo homepage: %d", r1.status_code)
-
-        # Step 2a: try the getcrumb endpoint first
-        crumb = None
-        for base in ("https://query1.finance.yahoo.com",
-                     "https://query2.finance.yahoo.com"):
-            try:
-                r2 = sess.get(f"{base}/v1/test/getcrumb", timeout=10)
-                candidate = r2.text.strip().strip('"')
-                if r2.status_code == 200 and 5 <= len(candidate) <= 20:
-                    crumb = candidate
-                    break
-            except Exception:
-                pass
-
-        # Step 2b: fall back to extracting crumb from the page HTML
-        if not crumb:
-            logger.info("getcrumb blocked — extracting crumb from page HTML")
-            for page_url in (
-                "https://finance.yahoo.com/quote/AAPL/",
-                "https://finance.yahoo.com/",
-            ):
-                try:
-                    rp = sess.get(page_url, timeout=15)
-                    m  = _CRUMB_RE.search(rp.text)
-                    if m:
-                        crumb = m.group(1).encode().decode("unicode_escape")
-                        logger.info("Extracted crumb from HTML: %r", crumb)
-                        break
-                except Exception:
-                    pass
-
-        if not crumb:
-            logger.warning("Could not obtain Yahoo Finance crumb")
-            return False
-
-        sess.headers.update(API_HEADERS)
-        _session = sess
-        _crumb   = crumb
-        return True
-
-    except Exception as exc:
-        logger.error("Session init error: %s", exc)
-        return False
-
-
-def _ensure_session() -> bool:
-    """Make sure we have a valid session/crumb, reinitialising if needed."""
-    global _session, _crumb
-    if _session and _crumb:
-        return True
-    return _init_session()
-
-
 # ── FMP config ────────────────────────────────────────────────────────────────
+FMP_API_KEY  = os.environ.get("FMP_API_KEY", "")
+FMP_BASE     = "https://financialmodelingprep.com/stable"
+FMP_HEADERS  = {"Accept": "application/json"}
 
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
-FMP_INCOME_URL = (
-    "https://financialmodelingprep.com/stable/income-statement"
-    "?symbol={symbol}&period=quarter&limit=3&apikey={apikey}"
-)
+# Max tickers per batch call (FMP accepts comma-separated lists)
+BATCH_SIZE   = 50
+# Parallel workers for per-ticker quarterly calls
+MAX_WORKERS  = 10
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe_float(val):
     try:
@@ -182,27 +83,112 @@ def _safe_float(val):
         return None
 
 
-def _get_quarterly_deltas_fmp(symbol: str) -> tuple:
+def _fmp_get(path: str, params: dict) -> list | dict | None:
+    """GET from FMP stable API, return parsed JSON or None on error."""
+    params["apikey"] = FMP_API_KEY
+    try:
+        r = requests.get(f"{FMP_BASE}/{path}", params=params,
+                         headers=FMP_HEADERS, timeout=15)
+        if r.status_code == 429:
+            logger.warning("FMP rate limit on %s — waiting 10s", path)
+            time.sleep(10)
+            r = requests.get(f"{FMP_BASE}/{path}", params=params,
+                             headers=FMP_HEADERS, timeout=15)
+        if r.status_code != 200:
+            logger.warning("FMP %s HTTP %d", path, r.status_code)
+            return None
+        return r.json()
+    except Exception as exc:
+        logger.warning("FMP %s error: %s", path, exc)
+        return None
+
+
+def _batch_quotes(tickers: list) -> dict:
     """
-    Fetch last 2 quarterly income statements from FMP and compute
-    QoQ operating margin delta and gross margin delta.
+    Fetch real-time quotes for all tickers in one call.
+    Returns dict keyed by symbol: {price, chg_pct, mkt_cap, pe, fwd_pe, eps}
+    """
+    out = {}
+    for i in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[i:i + BATCH_SIZE]
+        data  = _fmp_get("quote", {"symbol": ",".join(chunk)})
+        if not isinstance(data, list):
+            continue
+        for q in data:
+            sym = (q.get("symbol") or "").upper()
+            if not sym:
+                continue
+            chg_raw = _safe_float(q.get("changesPercentage"))
+            out[sym] = {
+                "price":   _safe_float(q.get("price")),
+                "chg_pct": round(chg_raw, 2) if chg_raw is not None else None,
+                "mkt_cap": _safe_float(q.get("marketCap")),
+                "pe":      _safe_float(q.get("pe")),
+                "eps":     _safe_float(q.get("eps")),
+            }
+    return out
+
+
+def _batch_ratios(tickers: list) -> dict:
+    """
+    Fetch TTM ratios for all tickers — P/S, PEG, fwd P/E, margins, rev growth.
+    Returns dict keyed by symbol.
+    """
+    out = {}
+    for i in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[i:i + BATCH_SIZE]
+        data  = _fmp_get("ratios-ttm", {"symbol": ",".join(chunk)})
+        if not isinstance(data, list):
+            continue
+        for r in data:
+            sym = (r.get("symbol") or "").upper()
+            if not sym:
+                continue
+            out[sym] = {
+                "peg":          _safe_float(r.get("priceEarningsToGrowthRatioTTM")),
+                "ps":           _safe_float(r.get("priceToSalesRatioTTM")),
+                "fwd_pe":       _safe_float(r.get("priceToEarningsRatioTTM")),
+                "rev_growth":   _safe_float(r.get("revenueGrowthTTM")),
+                "gross_margin": _safe_float(r.get("grossProfitMarginTTM")),
+                "op_margin":    _safe_float(r.get("operatingProfitMarginTTM")),
+            }
+    return out
+
+
+def _batch_fwd_pe(tickers: list) -> dict:
+    """
+    Fetch key metrics TTM for fwd P/E (priceToEarningsRatioTTM from key-metrics is fwd).
+    Actually use /key-metrics for forwardPE separately.
+    Returns dict keyed by symbol: {fwd_pe}
+    """
+    out = {}
+    for i in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[i:i + BATCH_SIZE]
+        data  = _fmp_get("key-metrics-ttm", {"symbol": ",".join(chunk)})
+        if not isinstance(data, list):
+            continue
+        for r in data:
+            sym = (r.get("symbol") or "").upper()
+            if not sym:
+                continue
+            out[sym] = _safe_float(r.get("peRatioTTM"))
+    return out
+
+
+def _quarterly_deltas(symbol: str) -> tuple:
+    """
+    Fetch last 2 quarterly income statements from FMP.
     Returns (op_delta, gm_delta) as fractions (e.g. 0.02 = +2pp).
-    Returns (None, None) on any error.
     """
-    if not FMP_API_KEY:
+    data = _fmp_get("income-statement", {
+        "symbol": symbol.upper(),
+        "period": "quarter",
+        "limit":  3,
+    })
+    if not isinstance(data, list) or len(data) < 2:
         return None, None
     try:
-        url  = FMP_INCOME_URL.format(symbol=symbol.upper(), apikey=FMP_API_KEY)
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            logger.warning("FMP %s: HTTP %d", symbol, resp.status_code)
-            return None, None
-        stmts = resp.json()
-        if not stmts or len(stmts) < 2:
-            return None, None
-
-        s0, s1 = stmts[0], stmts[1]  # most recent, then prior quarter
-
+        s0, s1 = data[0], data[1]
         r0 = _safe_float(s0.get("revenue"))
         r1 = _safe_float(s1.get("revenue"))
         if not r0 or not r1:
@@ -216,163 +202,80 @@ def _get_quarterly_deltas_fmp(symbol: str) -> tuple:
         oi1 = _safe_float(s1.get("operatingIncome"))
         op_delta = (oi0 / r0 - oi1 / r1) if oi0 is not None and oi1 is not None else None
 
-        logger.debug(
-            "FMP QoQ %s: r0=%s r1=%s gp0=%s gp1=%s oi0=%s oi1=%s → gm_Δ=%s op_Δ=%s",
-            symbol, r0, r1, gp0, gp1, oi0, oi1, gm_delta, op_delta,
-        )
         return op_delta, gm_delta
-
     except Exception as exc:
-        logger.warning("FMP quarterly error %s: %s", symbol, exc)
+        logger.warning("QoQ delta error %s: %s", symbol, exc)
         return None, None
 
 
-def _get_quarterly_deltas(quarterly_stmts: list) -> tuple:
-    try:
-        if not quarterly_stmts or len(quarterly_stmts) < 2:
-            return None, None
+# ── Main scan ─────────────────────────────────────────────────────────────────
 
-        def raw(stmt, key):
-            v = stmt.get(key, {})
-            if isinstance(v, dict):
-                return _safe_float(v.get("raw"))
-            return _safe_float(v)
+def scan_tickers(tickers: list, delay: float = 0) -> list:
+    """
+    Scan a list of tickers using FMP exclusively.
+    1. Batch quote        → price, chg%, mkt cap, P/E
+    2. Batch ratios-ttm   → P/S, PEG, margins, rev growth
+    3. Parallel quarterly → QoQ margin deltas (per ticker, concurrent)
+    """
+    if not FMP_API_KEY:
+        raise RuntimeError("FMP_API_KEY not set")
 
-        def first_nonzero(stmt, *keys):
-            """Return first non-None, non-zero value across keys."""
-            for k in keys:
-                v = raw(stmt, k)
-                if v is not None and v != 0.0:
-                    return v
-            return None
+    logger.info("Scanning %d tickers via FMP...", len(tickers))
 
-        s0, s1 = quarterly_stmts[0], quarterly_stmts[1]
+    # Step 1 & 2: batch calls (fast — 1-2 round trips each)
+    quotes  = _batch_quotes(tickers)
+    ratios  = _batch_ratios(tickers)
 
-        r0 = raw(s0, "totalRevenue")
-        r1 = raw(s1, "totalRevenue")
-        if not r0 or not r1:
-            return None, None
+    logger.info("Batch quotes: %d, ratios: %d", len(quotes), len(ratios))
 
-        # grossProfit: direct field or compute from revenue - COGS (only if COGS is non-zero)
-        def get_gross_profit(stmt, rev):
-            gp = raw(stmt, "grossProfit")
-            if gp:  # non-None, non-zero
-                return gp
-            cogs = raw(stmt, "costOfRevenue")
-            if cogs:  # only use COGS fallback if COGS is also non-zero
-                return rev - cogs
-            return None  # Yahoo returned zeros — can't compute
+    # Step 3: parallel quarterly deltas
+    deltas = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_map = {pool.submit(_quarterly_deltas, sym): sym for sym in tickers}
+        for future in concurrent.futures.as_completed(future_map):
+            sym = future_map[future]
+            try:
+                deltas[sym] = future.result()
+            except Exception as exc:
+                logger.warning("Delta error %s: %s", sym, exc)
+                deltas[sym] = (None, None)
 
-        gp0 = get_gross_profit(s0, r0)
-        gp1 = get_gross_profit(s1, r1)
-        gm_delta = (gp0 / r0 - gp1 / r1) if gp0 is not None and gp1 is not None else None
+    logger.info("Quarterly deltas fetched for %d tickers", len(deltas))
 
-        # operatingIncome: prefer operatingIncome, fall back to ebit
-        # first_nonzero skips zero placeholders Yahoo sometimes returns
-        oi0 = first_nonzero(s0, "operatingIncome", "ebit")
-        oi1 = first_nonzero(s1, "operatingIncome", "ebit")
-        op_delta = (oi0 / r0 - oi1 / r1) if oi0 is not None and oi1 is not None else None
-
-        logger.debug("QoQ r0=%s r1=%s gp0=%s gp1=%s oi0=%s oi1=%s", r0, r1, gp0, gp1, oi0, oi1)
-        return op_delta, gm_delta
-    except Exception as exc:
-        logger.debug("quarterly delta error: %s", exc)
-        return None, None
-
-
-# ── Single-ticker scan ────────────────────────────────────────────────────────
-
-def scan_ticker(symbol: str, retries: int = 2) -> dict:
-    global _session, _crumb
-
-    if not _ensure_session():
-        raise RuntimeError("Could not establish Yahoo Finance session")
-
-    last_exc = None
-    for attempt in range(retries + 1):
-        try:
-            url  = QUOTE_URL.format(symbol=symbol, crumb=_crumb)
-            resp = _session.get(url, timeout=15)
-
-            if resp.status_code == 401:
-                # Crumb expired — reinit and retry
-                logger.warning("%s: 401, reiniting session (attempt %d)", symbol, attempt)
-                _session = None
-                _crumb   = None
-                if not _init_session():
-                    raise RuntimeError("Session reinit failed")
-                continue
-
-            if resp.status_code == 429:
-                wait = 30 * (attempt + 1)
-                logger.warning("%s: 429 rate limited, waiting %ds", symbol, wait)
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-            data = resp.json()
-            break
-
-        except (RuntimeError, requests.RequestException) as exc:
-            last_exc = exc
-            if attempt < retries:
-                time.sleep(5 * (attempt + 1))
-    else:
-        raise RuntimeError(f"{symbol}: {last_exc}")
-
-    result = (data.get("quoteSummary") or {}).get("result") or []
-    if not result:
-        raise RuntimeError(f"{symbol}: empty result")
-    r = result[0]
-
-    def g(module, key):
-        m = r.get(module) or {}
-        v = m.get(key)
-        if isinstance(v, dict):
-            return _safe_float(v.get("raw"))
-        return _safe_float(v)
-
-    price   = g("price", "regularMarketPrice") or g("summaryDetail", "previousClose")
-    chg_raw = g("price", "regularMarketChangePercent")
-    chg_pct = round(chg_raw * 100, 2) if chg_raw is not None else None
-
-    # Use FMP for quarterly P&L (Yahoo returns zeros for grossProfit/operatingIncome)
-    op_delta, gm_delta = _get_quarterly_deltas_fmp(symbol)
-
-    return {
-        "ticker":       symbol,
-        "price":        price,
-        "chg_pct":      chg_pct,
-        "mkt_cap":      g("summaryDetail", "marketCap") or g("price", "marketCap"),
-        "pe":           g("summaryDetail", "trailingPE"),
-        "fwd_pe":       g("defaultKeyStatistics", "forwardPE"),
-        "peg":          g("defaultKeyStatistics", "pegRatio"),
-        "ps":           g("summaryDetail", "priceToSalesTrailing12Months"),
-        "rev_growth":   g("financialData", "revenueGrowth"),
-        "gross_margin": g("financialData", "grossMargins"),
-        "op_margin":    g("financialData", "operatingMargins"),
-        "op_delta":     op_delta,
-        "gm_delta":     gm_delta,
-    }
-
-
-# ── Batch scan ────────────────────────────────────────────────────────────────
-
-def scan_tickers(tickers: list, delay: float = 1.5) -> list:
+    # Merge
     results = []
     for sym in tickers:
-        try:
-            r = scan_ticker(sym)
-            results.append(r)
-            logger.info(
-                "  %s ✓  P/E: %s  FwdPE: %s  RevG: %s  OpMgn: %s",
-                sym,
-                f"{r['pe']:.1f}"              if r["pe"]         is not None else "—",
-                f"{r['fwd_pe']:.1f}"          if r["fwd_pe"]     is not None else "—",
-                f"{r['rev_growth']*100:.1f}%" if r["rev_growth"] is not None else "—",
-                f"{r['op_margin']*100:.1f}%"  if r["op_margin"]  is not None else "—",
-            )
-        except Exception as exc:
-            logger.warning("  %s error: %s", sym, exc)
-        time.sleep(delay)
+        q  = quotes.get(sym, {})
+        ra = ratios.get(sym, {})
+        op_delta, gm_delta = deltas.get(sym, (None, None))
+
+        if not q:
+            logger.warning("  %s — no quote data", sym)
+            continue
+
+        row = {
+            "ticker":       sym,
+            "price":        q.get("price"),
+            "chg_pct":      q.get("chg_pct"),
+            "mkt_cap":      q.get("mkt_cap"),
+            "pe":           q.get("pe"),
+            "fwd_pe":       ra.get("fwd_pe"),
+            "peg":          ra.get("peg"),
+            "ps":           ra.get("ps"),
+            "rev_growth":   ra.get("rev_growth"),
+            "gross_margin": ra.get("gross_margin"),
+            "op_margin":    ra.get("op_margin"),
+            "op_delta":     op_delta,
+            "gm_delta":     gm_delta,
+        }
+        results.append(row)
+        logger.info(
+            "  %s ✓  $%.2f  P/E: %s  RevG: %s  OpMgn: %s",
+            sym,
+            q.get("price") or 0,
+            f"{row['pe']:.1f}"              if row["pe"]         is not None else "—",
+            f"{row['rev_growth']*100:.1f}%" if row["rev_growth"] is not None else "—",
+            f"{row['op_margin']*100:.1f}%"  if row["op_margin"]  is not None else "—",
+        )
+
     return results
