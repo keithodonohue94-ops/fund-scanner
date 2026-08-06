@@ -64,7 +64,8 @@ UNIVERSES = {
 
 # ── FMP config ────────────────────────────────────────────────────────────────
 FMP_API_KEY  = os.environ.get("FMP_API_KEY", "")
-FMP_BASE     = "https://financialmodelingprep.com/stable"
+FMP_V3       = "https://financialmodelingprep.com/api/v3"
+FMP_STABLE   = "https://financialmodelingprep.com/stable"
 FMP_HEADERS  = {"Accept": "application/json"}
 
 # Max tickers per batch call (FMP accepts comma-separated lists)
@@ -83,36 +84,38 @@ def _safe_float(val):
         return None
 
 
-def _fmp_get(path: str, params: dict) -> list | dict | None:
-    """GET from FMP stable API, return parsed JSON or None on error."""
+def _fmp_get(url: str, params: dict) -> list | dict | None:
+    """GET from FMP API, return parsed JSON or None on error."""
     params["apikey"] = FMP_API_KEY
     try:
-        r = requests.get(f"{FMP_BASE}/{path}", params=params,
-                         headers=FMP_HEADERS, timeout=15)
+        r = requests.get(url, params=params, headers=FMP_HEADERS, timeout=15)
         if r.status_code == 429:
-            logger.warning("FMP rate limit on %s — waiting 10s", path)
+            logger.warning("FMP rate limit — waiting 10s")
             time.sleep(10)
-            r = requests.get(f"{FMP_BASE}/{path}", params=params,
-                             headers=FMP_HEADERS, timeout=15)
+            r = requests.get(url, params=params, headers=FMP_HEADERS, timeout=15)
         if r.status_code != 200:
-            logger.warning("FMP %s HTTP %d", path, r.status_code)
+            logger.warning("FMP %s HTTP %d: %s", url, r.status_code, r.text[:200])
             return None
         return r.json()
     except Exception as exc:
-        logger.warning("FMP %s error: %s", path, exc)
+        logger.warning("FMP %s error: %s", url, exc)
         return None
 
 
 def _batch_quotes(tickers: list) -> dict:
     """
-    Fetch real-time quotes for all tickers in one call.
-    Returns dict keyed by symbol: {price, chg_pct, mkt_cap, pe, fwd_pe, eps}
+    Fetch real-time quotes for all tickers.
+    Uses v3 path-based batch: /api/v3/quote/AAPL,MSFT,...
+    Returns dict keyed by symbol.
     """
     out = {}
     for i in range(0, len(tickers), BATCH_SIZE):
-        chunk = tickers[i:i + BATCH_SIZE]
-        data  = _fmp_get("quote", {"symbol": ",".join(chunk)})
+        chunk    = tickers[i:i + BATCH_SIZE]
+        symbols  = ",".join(chunk)
+        url      = f"{FMP_V3}/quote/{symbols}"
+        data     = _fmp_get(url, {})
         if not isinstance(data, list):
+            logger.warning("Batch quotes: unexpected response type for %s", symbols[:40])
             continue
         for q in data:
             sym = (q.get("symbol") or "").upper()
@@ -129,49 +132,41 @@ def _batch_quotes(tickers: list) -> dict:
     return out
 
 
+def _fetch_ratios(symbol: str) -> dict:
+    """
+    Fetch TTM ratios for one ticker via v3.
+    Returns dict with peg, ps, fwd_pe, rev_growth, gross_margin, op_margin.
+    """
+    url  = f"{FMP_V3}/ratios-ttm/{symbol.upper()}"
+    data = _fmp_get(url, {})
+    if isinstance(data, list) and data:
+        r = data[0]
+    elif isinstance(data, dict):
+        r = data
+    else:
+        return {}
+    return {
+        "peg":          _safe_float(r.get("priceEarningsToGrowthRatioTTM")),
+        "ps":           _safe_float(r.get("priceToSalesRatioTTM")),
+        "fwd_pe":       _safe_float(r.get("priceToEarningsRatioTTM")),
+        "rev_growth":   _safe_float(r.get("revenueGrowthTTM")),
+        "gross_margin": _safe_float(r.get("grossProfitMarginTTM")),
+        "op_margin":    _safe_float(r.get("operatingProfitMarginTTM")),
+    }
+
+
 def _batch_ratios(tickers: list) -> dict:
-    """
-    Fetch TTM ratios for all tickers — P/S, PEG, fwd P/E, margins, rev growth.
-    Returns dict keyed by symbol.
-    """
+    """Parallel TTM ratios fetch for all tickers."""
     out = {}
-    for i in range(0, len(tickers), BATCH_SIZE):
-        chunk = tickers[i:i + BATCH_SIZE]
-        data  = _fmp_get("ratios-ttm", {"symbol": ",".join(chunk)})
-        if not isinstance(data, list):
-            continue
-        for r in data:
-            sym = (r.get("symbol") or "").upper()
-            if not sym:
-                continue
-            out[sym] = {
-                "peg":          _safe_float(r.get("priceEarningsToGrowthRatioTTM")),
-                "ps":           _safe_float(r.get("priceToSalesRatioTTM")),
-                "fwd_pe":       _safe_float(r.get("priceToEarningsRatioTTM")),
-                "rev_growth":   _safe_float(r.get("revenueGrowthTTM")),
-                "gross_margin": _safe_float(r.get("grossProfitMarginTTM")),
-                "op_margin":    _safe_float(r.get("operatingProfitMarginTTM")),
-            }
-    return out
-
-
-def _batch_fwd_pe(tickers: list) -> dict:
-    """
-    Fetch key metrics TTM for fwd P/E (priceToEarningsRatioTTM from key-metrics is fwd).
-    Actually use /key-metrics for forwardPE separately.
-    Returns dict keyed by symbol: {fwd_pe}
-    """
-    out = {}
-    for i in range(0, len(tickers), BATCH_SIZE):
-        chunk = tickers[i:i + BATCH_SIZE]
-        data  = _fmp_get("key-metrics-ttm", {"symbol": ",".join(chunk)})
-        if not isinstance(data, list):
-            continue
-        for r in data:
-            sym = (r.get("symbol") or "").upper()
-            if not sym:
-                continue
-            out[sym] = _safe_float(r.get("peRatioTTM"))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_map = {pool.submit(_fetch_ratios, sym): sym for sym in tickers}
+        for future in concurrent.futures.as_completed(future_map):
+            sym = future_map[future]
+            try:
+                out[sym] = future.result()
+            except Exception as exc:
+                logger.warning("Ratios error %s: %s", sym, exc)
+                out[sym] = {}
     return out
 
 
@@ -180,11 +175,8 @@ def _quarterly_deltas(symbol: str) -> tuple:
     Fetch last 2 quarterly income statements from FMP.
     Returns (op_delta, gm_delta) as fractions (e.g. 0.02 = +2pp).
     """
-    data = _fmp_get("income-statement", {
-        "symbol": symbol.upper(),
-        "period": "quarter",
-        "limit":  3,
-    })
+    url  = f"{FMP_V3}/income-statement/{symbol.upper()}"
+    data = _fmp_get(url, {"period": "quarter", "limit": 3})
     if not isinstance(data, list) or len(data) < 2:
         return None, None
     try:
