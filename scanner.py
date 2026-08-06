@@ -26,6 +26,26 @@ UNIVERSES = {
         "ALAB","MRVL","CRDO","MU","MOD","STRL","ANET","VICR",
         "ORA","FLNC","ETN","PWR","NVDA","SMCI","INTC","MPWR","VRT",
     ],
+    "aiinfra": [
+        "ETN","PWR","LITE","MKSI","MOD","STRL","INOD","ANET","CLS",
+        "MRVL","SITM","MPWR","CRDO","CRS","GLW","POWL","TTMI","INTC",
+        "VRT","NVDA","SMCI","ALAB","MU","AMD","QCOM","ARM","TSM",
+        "AVGO","LRCX","AMAT","KLAC","ADI",
+    ],
+    "cybersec": [
+        "S","QLYS","OKTA","CRWD","PANW","ZS","NET","FTNT","CYBR",
+        "SAIL","SHC","TENB","RPD",
+    ],
+    "rareearths": [
+        "MP","IDR","USAR","TMC","NB","UUUU","DNN",
+    ],
+    "energy": [
+        "ENPH","FSLR","PLUG","RUN","SEDG","BE","NOVA","ARRY","SHLS",
+        "AES","NEE","CEG","VST","NRG",
+    ],
+    "orbital": [
+        "BKSY","PLTR","PL","RDW","RKLB","ASTS","LUNR","MNTS",
+    ],
     "soxx": [
         "MU","AMD","AVGO","INTC","NVDA","MRVL","AMAT","TXN","QCOM",
         "NXPI","MPWR","LRCX","KLAC","ADI","TER","MCHP","TSM","ASML",
