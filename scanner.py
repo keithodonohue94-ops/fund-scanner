@@ -102,39 +102,40 @@ def _fmp_get(url: str, params: dict) -> list | dict | None:
         return None
 
 
+def _fetch_quote(symbol: str) -> dict:
+    """Fetch real-time quote for one ticker via FMP stable API."""
+    url  = f"{FMP_STABLE}/quote"
+    data = _fmp_get(url, {"symbol": symbol.upper()})
+    # Stable returns a list with one item
+    if isinstance(data, list) and data:
+        q = data[0]
+    elif isinstance(data, dict):
+        q = data
+    else:
+        return {}
+    chg_raw = _safe_float(q.get("changesPercentage"))
+    return {
+        "price":   _safe_float(q.get("price")),
+        "chg_pct": round(chg_raw, 2) if chg_raw is not None else None,
+        "mkt_cap": _safe_float(q.get("marketCap")),
+        "pe":      _safe_float(q.get("pe")),
+        "eps":     _safe_float(q.get("eps")),
+    }
+
+
 def _batch_quotes(tickers: list) -> dict:
-    """
-    Fetch real-time quotes for all tickers via FMP stable API.
-    Returns dict keyed by symbol.
-    """
+    """Parallel quote fetch for all tickers."""
     out = {}
-    for i in range(0, len(tickers), BATCH_SIZE):
-        chunk   = tickers[i:i + BATCH_SIZE]
-        symbols = ",".join(chunk)
-        url     = f"{FMP_STABLE}/quote"
-        data    = _fmp_get(url, {"symbol": symbols})
-        logger.info("Quote response type=%s len=%s sample=%s",
-                    type(data).__name__,
-                    len(data) if isinstance(data, (list, dict)) else "n/a",
-                    str(data)[:200] if data else "None")
-        if not isinstance(data, list):
-            # Some stable endpoints wrap in {"data": [...]}
-            if isinstance(data, dict) and "data" in data:
-                data = data["data"]
-            else:
-                continue
-        for q in data:
-            sym = (q.get("symbol") or "").upper()
-            if not sym:
-                continue
-            chg_raw = _safe_float(q.get("changesPercentage"))
-            out[sym] = {
-                "price":   _safe_float(q.get("price")),
-                "chg_pct": round(chg_raw, 2) if chg_raw is not None else None,
-                "mkt_cap": _safe_float(q.get("marketCap")),
-                "pe":      _safe_float(q.get("pe")),
-                "eps":     _safe_float(q.get("eps")),
-            }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_map = {pool.submit(_fetch_quote, sym): sym for sym in tickers}
+        for future in concurrent.futures.as_completed(future_map):
+            sym = future_map[future]
+            try:
+                result = future.result()
+                if result:
+                    out[sym] = result
+            except Exception as exc:
+                logger.warning("Quote error %s: %s", sym, exc)
     return out
 
 
