@@ -83,8 +83,11 @@ SCAN_ORDER = [
 
 # ── Scanner logic ─────────────────────────────────────────────────────────────
 
-def _run_scan(universe_key: str):
-    """Fetch fundamentals for one universe and update cache. Thread-safe."""
+def _run_scan(universe_key: str, save_to_db: bool = False):
+    """Fetch fundamentals for one universe and update cache. Thread-safe.
+
+    save_to_db: only True for the scheduled 4pm ET EOD run.
+    """
     if universe_key in SCANNING:
         logger.info("Already scanning %s — skipping", universe_key)
         return
@@ -94,7 +97,8 @@ def _run_scan(universe_key: str):
         return
 
     SCANNING.add(universe_key)
-    logger.info("Starting scan: %s (%d tickers)", universe_key, len(tickers))
+    logger.info("Starting scan: %s (%d tickers)%s", universe_key, len(tickers),
+                " [EOD — will save to DB]" if save_to_db else "")
     try:
         results = scan_tickers(tickers)
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -106,11 +110,11 @@ def _run_scan(universe_key: str):
                 "universe":   universe_key,
             }
         logger.info("Done: %s — %d results", universe_key, len(results))
-        # Persist to database for historical reporting
-        try:
-            _db.save_snapshot(universe_key, results)
-        except Exception as db_exc:
-            logger.error("DB save error (%s): %s", universe_key, db_exc)
+        if save_to_db:
+            try:
+                _db.save_snapshot(universe_key, results)
+            except Exception as db_exc:
+                logger.error("DB save error (%s): %s", universe_key, db_exc)
     except Exception as exc:
         logger.error("Scan error (%s): %s", universe_key, exc)
     finally:
@@ -142,11 +146,11 @@ def _background_scheduler():
     logger.info("Startup scan done. Waiting for next 4pm ET window.")
     while True:
         time.sleep(_next_4pm_eastern())
-        logger.info("4pm ET — starting full universe scan (%d universes)", len(SCAN_ORDER))
+        logger.info("4pm ET — starting EOD scan (%d universes)", len(SCAN_ORDER))
         for ukey in SCAN_ORDER:
-            _run_scan(ukey)
+            _run_scan(ukey, save_to_db=True)
             time.sleep(15)   # 15s between universes to avoid FMP rate limits
-        logger.info("Full universe scan complete.")
+        logger.info("EOD scan complete — all results saved to DB.")
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
