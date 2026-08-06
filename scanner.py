@@ -113,11 +113,7 @@ def _fetch_quote(symbol: str) -> dict:
         q = data
     else:
         return {}
-    # Debug first ticker to see field names
-    if symbol.upper() == "ALAB":
-        logger.info("QUOTE FIELDS for %s: %s", symbol, list(q.keys()))
-        logger.info("QUOTE SAMPLE: %s", {k: q[k] for k in list(q.keys())[:15]})
-    chg_raw = _safe_float(q.get("changesPercentage") or q.get("changePercent") or q.get("change_percent"))
+    chg_raw = _safe_float(q.get("changePercentage"))
     pe      = _safe_float(q.get("pe") or q.get("priceEarningsRatio") or q.get("peRatio"))
     return {
         "price":   _safe_float(q.get("price")),
@@ -157,10 +153,6 @@ def _fetch_ratios(symbol: str) -> dict:
         r = data
     else:
         return {}
-    # Debug first ticker to see field names
-    if symbol.upper() == "ALAB":
-        logger.info("RATIOS FIELDS for %s: %s", symbol, list(r.keys()))
-        logger.info("RATIOS SAMPLE: %s", {k: r[k] for k in list(r.keys())[:20]})
     return {
         "pe":           _safe_float(r.get("priceToEarningsRatioTTM")),
         "peg":          _safe_float(r.get("priceToEarningsGrowthRatioTTM")),
