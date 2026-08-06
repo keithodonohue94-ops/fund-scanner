@@ -104,19 +104,25 @@ def _fmp_get(url: str, params: dict) -> list | dict | None:
 
 def _batch_quotes(tickers: list) -> dict:
     """
-    Fetch real-time quotes for all tickers.
-    Uses v3 path-based batch: /api/v3/quote/AAPL,MSFT,...
+    Fetch real-time quotes for all tickers via FMP stable API.
     Returns dict keyed by symbol.
     """
     out = {}
     for i in range(0, len(tickers), BATCH_SIZE):
-        chunk    = tickers[i:i + BATCH_SIZE]
-        symbols  = ",".join(chunk)
-        url      = f"{FMP_V3}/quote/{symbols}"
-        data     = _fmp_get(url, {})
+        chunk   = tickers[i:i + BATCH_SIZE]
+        symbols = ",".join(chunk)
+        url     = f"{FMP_STABLE}/quote"
+        data    = _fmp_get(url, {"symbol": symbols})
+        logger.info("Quote response type=%s len=%s sample=%s",
+                    type(data).__name__,
+                    len(data) if isinstance(data, (list, dict)) else "n/a",
+                    str(data)[:200] if data else "None")
         if not isinstance(data, list):
-            logger.warning("Batch quotes: unexpected response type for %s", symbols[:40])
-            continue
+            # Some stable endpoints wrap in {"data": [...]}
+            if isinstance(data, dict) and "data" in data:
+                data = data["data"]
+            else:
+                continue
         for q in data:
             sym = (q.get("symbol") or "").upper()
             if not sym:
@@ -134,11 +140,11 @@ def _batch_quotes(tickers: list) -> dict:
 
 def _fetch_ratios(symbol: str) -> dict:
     """
-    Fetch TTM ratios for one ticker via v3.
+    Fetch TTM ratios for one ticker via stable API.
     Returns dict with peg, ps, fwd_pe, rev_growth, gross_margin, op_margin.
     """
-    url  = f"{FMP_V3}/ratios-ttm/{symbol.upper()}"
-    data = _fmp_get(url, {})
+    url  = f"{FMP_STABLE}/ratios-ttm"
+    data = _fmp_get(url, {"symbol": symbol.upper()})
     if isinstance(data, list) and data:
         r = data[0]
     elif isinstance(data, dict):
@@ -175,8 +181,8 @@ def _quarterly_deltas(symbol: str) -> tuple:
     Fetch last 2 quarterly income statements from FMP.
     Returns (op_delta, gm_delta) as fractions (e.g. 0.02 = +2pp).
     """
-    url  = f"{FMP_V3}/income-statement/{symbol.upper()}"
-    data = _fmp_get(url, {"period": "quarter", "limit": 3})
+    url  = f"{FMP_STABLE}/income-statement"
+    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "quarter", "limit": 3})
     if not isinstance(data, list) or len(data) < 2:
         return None, None
     try:
