@@ -83,17 +83,19 @@ SCAN_ORDER = [
 
 # ── Scanner logic ─────────────────────────────────────────────────────────────
 
-def _run_scan(universe_key: str, save_to_db: bool = False):
+def _run_scan(universe_key: str, save_to_db: bool = False, tickers: list = None):
     """Fetch fundamentals for one universe and update cache. Thread-safe.
 
+    tickers: if provided, use these directly (from frontend) instead of hardcoded UNIVERSES.
     save_to_db: only True for the scheduled 4pm ET EOD run.
     """
     if universe_key in SCANNING:
         logger.info("Already scanning %s — skipping", universe_key)
         return
-    tickers = UNIVERSES.get(universe_key)
     if not tickers:
-        logger.warning("Unknown universe: %s", universe_key)
+        tickers = UNIVERSES.get(universe_key)
+    if not tickers:
+        logger.warning("Unknown universe and no tickers provided: %s", universe_key)
         return
 
     SCANNING.add(universe_key)
@@ -229,11 +231,16 @@ def results():
 
 @app.route("/api/scan", methods=["POST"])
 def trigger_scan():
-    """Kick off a fresh async scan for a universe."""
+    """Kick off a fresh async scan for a universe.
+
+    Accepts {universe, tickers} — if tickers provided, uses those directly
+    rather than the hardcoded UNIVERSES dict, so any universe from the UI works.
+    """
     body     = request.get_json(silent=True) or {}
     universe = body.get("universe", "portfolio")
+    tickers  = body.get("tickers") or None  # list from frontend, or None to fall back to UNIVERSES
 
-    if universe not in UNIVERSES:
+    if not tickers and universe not in UNIVERSES:
         return jsonify({"error": f"Unknown universe: {universe}"}), 400
 
     if universe in SCANNING:
@@ -243,7 +250,7 @@ def trigger_scan():
     with _cache_lock:
         CACHE.pop(universe, None)
 
-    t = threading.Thread(target=_run_scan, args=(universe,), daemon=True)
+    t = threading.Thread(target=_run_scan, args=(universe,), kwargs={"tickers": tickers}, daemon=True)
     t.start()
     return jsonify({"status": "scanning", "universe": universe})
 

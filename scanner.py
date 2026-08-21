@@ -1,11 +1,13 @@
 """
 fund-scanner/scanner.py
-FMP-only fundamental data fetcher (Premium plan).
+FMP-only fundamental data fetcher.
 
 Data flow:
-  - Batch quote    (/stable/quote)               → price, chg%, mkt cap, P/E, fwd P/E, EPS
-  - Batch ratios   (/stable/ratios-ttm)          → PEG, P/S, gross/op margin, rev growth
-  - Per-ticker quarterly income (/stable/income-statement) → QoQ margin deltas
+  - Per-ticker quote      (/stable/quote)                → live price, chg%, mkt cap
+  - Per-ticker income     (/stable/income-statement)     → TTM EPS, TTM revenue, margins
+  - Per-ticker estimates  (/stable/analyst-estimates)    → forward EPS
+All multiples (P/E TTM, FWD P/E, PEG, P/S) are calculated dynamically from live price
+and raw fundamentals — NOT pulled from FMP's pre-calculated ratio endpoints.
 """
 
 import os
@@ -47,15 +49,14 @@ UNIVERSES = {
         "BKSY","PLTR","PL","RDW","RKLB","ASTS","LUNR","MNTS",
     ],
     "soxx": [
-        "MU","AMD","AVGO","INTC","NVDA","MRVL","AMAT","TXN","QCOM",
-        "NXPI","MPWR","LRCX","KLAC","ADI","TER","MCHP","TSM","ASML",
-        "ON","ALAB","CRDO","MTSI","ENTG","STX","SWKS","WOLF","CRUS",
-        "ACLS","FORM","MXL","AMBA","POWI","DIOD","AOSL",
+        "NVDA","MU","AMD","AVGO","INTC","AMAT","KLAC","MRVL","TSM","LRCX",
+        "ADI","TXN","MPWR","TER","NXPI","QCOM","ASML","ALAB","CRDO","MCHP",
+        "ON","ENTG","ASX","MTSI","UMC","SWKS","ACLS","CRUS","STX","FORM",
     ],
     "smh": [
-        "NVDA","TSM","AVGO","ASML","AMD","TXN","QCOM","AMAT","LRCX",
-        "KLAC","MU","ADI","MRVL","INTC","NXPI","MPWR","ON","MCHP",
-        "TER","STX","ENTG","SWKS","WOLF","AMBA","ACLS","CRUS",
+        "NVDA","TSM","AVGO","AMD","ASML","TXN","MU","ADI","AMAT","QCOM",
+        "KLAC","LRCX","INTC","MRVL","CDNS","SNPS","MPWR","TER","NXPI","STM",
+        "ARM","MCHP","ALAB","ON","SWKS",
     ],
     "ndx100": [
         "AAPL","MSFT","NVDA","AMZN","META","TSLA","GOOGL","GOOG",
@@ -84,13 +85,8 @@ UNIVERSES = {
 
 # ── FMP config ────────────────────────────────────────────────────────────────
 FMP_API_KEY  = os.environ.get("FMP_API_KEY", "")
-FMP_V3       = "https://financialmodelingprep.com/api/v3"
 FMP_STABLE   = "https://financialmodelingprep.com/stable"
 FMP_HEADERS  = {"Accept": "application/json"}
-
-# Max tickers per batch call (FMP accepts comma-separated lists)
-BATCH_SIZE   = 50
-# Parallel workers for per-ticker quarterly calls
 MAX_WORKERS  = 10
 
 
@@ -123,10 +119,8 @@ def _fmp_get(url: str, params: dict) -> list | dict | None:
 
 
 def _fetch_quote(symbol: str) -> dict:
-    """Fetch real-time quote for one ticker via FMP stable API."""
-    url  = f"{FMP_STABLE}/quote"
-    data = _fmp_get(url, {"symbol": symbol.upper()})
-    # Stable returns a list with one item
+    """Live price, change%, market cap from FMP quote endpoint."""
+    data = _fmp_get(f"{FMP_STABLE}/quote", {"symbol": symbol.upper()})
     if isinstance(data, list) and data:
         q = data[0]
     elif isinstance(data, dict):
@@ -134,176 +128,192 @@ def _fetch_quote(symbol: str) -> dict:
     else:
         return {}
     chg_raw = _safe_float(q.get("changePercentage"))
-    pe      = _safe_float(q.get("pe") or q.get("priceEarningsRatio") or q.get("peRatio"))
     return {
         "price":   _safe_float(q.get("price")),
         "chg_pct": round(chg_raw, 2) if chg_raw is not None else None,
         "mkt_cap": _safe_float(q.get("marketCap") or q.get("market_cap")),
-        "pe":      pe,
-        "eps":     _safe_float(q.get("eps")),
     }
 
 
-def _batch_quotes(tickers: list) -> dict:
-    """Parallel quote fetch for all tickers."""
-    out = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_map = {pool.submit(_fetch_quote, sym): sym for sym in tickers}
-        for future in concurrent.futures.as_completed(future_map):
-            sym = future_map[future]
-            try:
-                result = future.result()
-                if result:
-                    out[sym] = result
-            except Exception as exc:
-                logger.warning("Quote error %s: %s", sym, exc)
-    return out
-
-
-def _fetch_ratios(symbol: str) -> dict:
+def _fetch_income(symbol: str) -> dict:
     """
-    Fetch TTM ratios for one ticker via stable API.
-    Returns dict with peg, ps, fwd_pe, rev_growth, gross_margin, op_margin.
+    Fetch last 8 quarterly income statements and compute:
+      - ttm_eps:       sum of last 4 quarters' EPS
+      - ttm_rev:       sum of last 4 quarters' revenue
+      - prior_ttm_eps: sum of quarters 5-8 (prior year TTM)
+      - eps_growth:    YoY EPS growth as a fraction (e.g. 0.25 = +25%)
+      - rev_growth:    YoY revenue growth (most recent Q vs same Q -1yr)
+      - gross_margin:  most recent quarter gross profit / revenue
+      - op_margin:     most recent quarter operating income / revenue
+      - op_delta:      QoQ change in operating margin (pp)
+      - gm_delta:      QoQ change in gross margin (pp)
     """
-    url  = f"{FMP_STABLE}/ratios-ttm"
-    data = _fmp_get(url, {"symbol": symbol.upper()})
-    if isinstance(data, list) and data:
-        r = data[0]
-    elif isinstance(data, dict):
-        r = data
-    else:
+    data = _fmp_get(
+        f"{FMP_STABLE}/income-statement",
+        {"symbol": symbol.upper(), "period": "quarter", "limit": 8}
+    )
+    if not isinstance(data, list) or len(data) < 4:
         return {}
-    return {
-        "pe":           _safe_float(r.get("priceToEarningsRatioTTM")),
-        "peg":          _safe_float(r.get("priceToEarningsGrowthRatioTTM")),
-        "ps":           _safe_float(r.get("priceToSalesRatioTTM")),
-        "fwd_pe":       _safe_float(r.get("forwardPriceToEarningsGrowthRatioTTM") or r.get("priceToEarningsRatioTTM")),
-        "gross_margin": _safe_float(r.get("grossProfitMarginTTM")),
-        "op_margin":    _safe_float(r.get("operatingProfitMarginTTM")),
-    }
 
-
-def _batch_ratios(tickers: list) -> dict:
-    """Parallel TTM ratios fetch for all tickers."""
     out = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_map = {pool.submit(_fetch_ratios, sym): sym for sym in tickers}
-        for future in concurrent.futures.as_completed(future_map):
-            sym = future_map[future]
-            try:
-                out[sym] = future.result()
-            except Exception as exc:
-                logger.warning("Ratios error %s: %s", sym, exc)
-                out[sym] = {}
+
+    # TTM EPS and revenue (last 4 quarters)
+    ttm_eps = sum(filter(None, (_safe_float(q.get("eps")) for q in data[:4])))
+    ttm_rev = sum(filter(None, (_safe_float(q.get("revenue")) for q in data[:4])))
+    out["ttm_eps"] = ttm_eps if ttm_eps != 0 else None
+    out["ttm_rev"] = ttm_rev if ttm_rev != 0 else None
+
+    # Prior year TTM EPS (quarters 4-7, zero-indexed)
+    if len(data) >= 8:
+        prior_eps = sum(filter(None, (_safe_float(q.get("eps")) for q in data[4:8])))
+        out["prior_ttm_eps"] = prior_eps if prior_eps != 0 else None
+    else:
+        out["prior_ttm_eps"] = None
+
+    # EPS growth YoY
+    if out.get("ttm_eps") and out.get("prior_ttm_eps") and out["prior_ttm_eps"] != 0:
+        out["eps_growth"] = (out["ttm_eps"] - out["prior_ttm_eps"]) / abs(out["prior_ttm_eps"])
+    else:
+        out["eps_growth"] = None
+
+    # YoY revenue growth: most recent quarter vs same quarter prior year (index 4)
+    if len(data) >= 5:
+        r0    = _safe_float(data[0].get("revenue"))
+        r_yoy = _safe_float(data[4].get("revenue"))
+        out["rev_growth"] = (r0 - r_yoy) / abs(r_yoy) if r0 and r_yoy else None
+    else:
+        out["rev_growth"] = None
+
+    # Current quarter margins
+    s0 = data[0]
+    r0 = _safe_float(s0.get("revenue"))
+    if r0:
+        gp = _safe_float(s0.get("grossProfit"))
+        oi = _safe_float(s0.get("operatingIncome"))
+        out["gross_margin"] = gp / r0 if gp is not None else None
+        out["op_margin"]    = oi / r0 if oi is not None else None
+    else:
+        out["gross_margin"] = out["op_margin"] = None
+
+    # QoQ margin deltas
+    if len(data) >= 2:
+        s1 = data[1]
+        r1 = _safe_float(s1.get("revenue"))
+        if r0 and r1:
+            gp1 = _safe_float(s1.get("grossProfit"))
+            oi1 = _safe_float(s1.get("operatingIncome"))
+            gp0 = _safe_float(s0.get("grossProfit"))
+            oi0 = _safe_float(s0.get("operatingIncome"))
+            out["gm_delta"] = (gp0/r0 - gp1/r1) if gp0 is not None and gp1 is not None else None
+            out["op_delta"] = (oi0/r0 - oi1/r1) if oi0 is not None and oi1 is not None else None
+        else:
+            out["gm_delta"] = out["op_delta"] = None
+    else:
+        out["gm_delta"] = out["op_delta"] = None
+
     return out
 
 
-def _quarterly_data(symbol: str) -> tuple:
+def _fetch_fwd_eps(symbol: str) -> float | None:
     """
-    Fetch last 3 quarterly income statements from FMP.
-    Returns (op_delta, gm_delta, rev_growth) where deltas are pp fractions
-    and rev_growth is YoY % as a fraction (e.g. 0.41 = +41%).
+    Fetch analyst consensus forward EPS from FMP analyst estimates.
+    Returns the nearest future annual EPS estimate.
     """
-    url  = f"{FMP_STABLE}/income-statement"
-    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "quarter", "limit": 5})
-    if not isinstance(data, list) or len(data) < 2:
-        return None, None, None
-    try:
-        s0, s1 = data[0], data[1]
-        r0 = _safe_float(s0.get("revenue"))
-        r1 = _safe_float(s1.get("revenue"))
-        if not r0 or not r1:
-            return None, None, None
+    data = _fmp_get(
+        f"{FMP_STABLE}/analyst-estimates",
+        {"symbol": symbol.upper(), "period": "annual", "limit": 3}
+    )
+    if not isinstance(data, list) or not data:
+        return None
+    # FMP returns estimates sorted descending by date.
+    # Take the first one with a positive estimatedEpsAvg.
+    for row in data:
+        eps = _safe_float(row.get("estimatedEpsAvg"))
+        if eps is not None and eps > 0:
+            return eps
+    return None
 
-        gp0 = _safe_float(s0.get("grossProfit"))
-        gp1 = _safe_float(s1.get("grossProfit"))
-        gm_delta = (gp0 / r0 - gp1 / r1) if gp0 is not None and gp1 is not None else None
 
-        oi0 = _safe_float(s0.get("operatingIncome"))
-        oi1 = _safe_float(s1.get("operatingIncome"))
-        op_delta = (oi0 / r0 - oi1 / r1) if oi0 is not None and oi1 is not None else None
+def _fetch_all(symbol: str) -> dict:
+    """Fetch quote + income + fwd EPS for one ticker, return merged dict."""
+    quote  = _fetch_quote(symbol)
+    income = _fetch_income(symbol)
+    fwd_eps = _fetch_fwd_eps(symbol)
 
-        # YoY revenue growth: compare most recent quarter vs same quarter last year (index 4)
-        rev_growth = None
-        if len(data) >= 5:
-            r_yoy = _safe_float(data[4].get("revenue"))
-            if r_yoy and r0:
-                rev_growth = (r0 - r_yoy) / abs(r_yoy)
+    price   = quote.get("price")
+    mkt_cap = quote.get("mkt_cap")
+    ttm_eps = income.get("ttm_eps")
+    ttm_rev = income.get("ttm_rev")
+    eps_growth = income.get("eps_growth")
 
-        return op_delta, gm_delta, rev_growth
-    except Exception as exc:
-        logger.warning("Quarterly data error %s: %s", symbol, exc)
-        return None, None, None
+    # Dynamically calculated multiples
+    pe_ttm = round(price / ttm_eps, 1) if price and ttm_eps and ttm_eps > 0 else None
+    fwd_pe = round(price / fwd_eps, 1) if price and fwd_eps and fwd_eps > 0 else None
+    # PEG = P/E TTM / EPS growth rate (%)
+    peg    = round(pe_ttm / (eps_growth * 100), 2) if pe_ttm and eps_growth and eps_growth > 0 else None
+    # P/S = market cap / TTM revenue
+    ps     = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
+
+    return {
+        "price":        price,
+        "chg_pct":      quote.get("chg_pct"),
+        "mkt_cap":      mkt_cap,
+        "pe":           pe_ttm,
+        "fwd_pe":       fwd_pe,
+        "peg":          peg,
+        "ps":           ps,
+        "ttm_eps":      ttm_eps,
+        "fwd_eps":      fwd_eps,
+        "eps_growth":   eps_growth,
+        "rev_growth":   income.get("rev_growth"),
+        "gross_margin": income.get("gross_margin"),
+        "op_margin":    income.get("op_margin"),
+        "op_delta":     income.get("op_delta"),
+        "gm_delta":     income.get("gm_delta"),
+    }
 
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
 
 def scan_tickers(tickers: list, delay: float = 0) -> list:
     """
-    Scan a list of tickers using FMP exclusively.
-    1. Batch quote        → price, chg%, mkt cap, P/E
-    2. Batch ratios-ttm   → P/S, PEG, margins, rev growth
-    3. Parallel quarterly → QoQ margin deltas (per ticker, concurrent)
+    Scan a list of tickers using FMP.
+    All multiples are calculated from live price and raw fundamental data:
+      P/E TTM  = price / TTM EPS (sum of last 4 quarters)
+      FWD P/E  = price / analyst consensus fwd EPS
+      PEG      = P/E TTM / (YoY EPS growth %)
+      P/S      = market cap / TTM revenue
     """
     if not FMP_API_KEY:
         raise RuntimeError("FMP_API_KEY not set")
 
     logger.info("Scanning %d tickers via FMP...", len(tickers))
 
-    # Step 1 & 2: batch calls (fast — 1-2 round trips each)
-    quotes  = _batch_quotes(tickers)
-    ratios  = _batch_ratios(tickers)
-
-    logger.info("Batch quotes: %d, ratios: %d", len(quotes), len(ratios))
-
-    # Step 3: parallel quarterly data (deltas + rev growth)
-    deltas = {}
+    results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_map = {pool.submit(_quarterly_data, sym): sym for sym in tickers}
+        future_map = {pool.submit(_fetch_all, sym): sym for sym in tickers}
         for future in concurrent.futures.as_completed(future_map):
             sym = future_map[future]
             try:
-                deltas[sym] = future.result()
+                row = future.result()
+                if not row.get("price"):
+                    logger.warning("  %s — no quote data", sym)
+                    continue
+                row["ticker"] = sym
+                results.append(row)
+                logger.info(
+                    "  %s ✓  $%.2f  P/E TTM: %s  FWD P/E: %s  PEG: %s  P/S: %s",
+                    sym,
+                    row["price"] or 0,
+                    f"{row['pe']:.1f}"     if row["pe"]     is not None else "—",
+                    f"{row['fwd_pe']:.1f}" if row["fwd_pe"] is not None else "—",
+                    f"{row['peg']:.2f}"    if row["peg"]    is not None else "—",
+                    f"{row['ps']:.1f}"     if row["ps"]     is not None else "—",
+                )
             except Exception as exc:
-                logger.warning("Delta error %s: %s", sym, exc)
-                deltas[sym] = (None, None, None)
+                logger.warning("Scan error %s: %s", sym, exc)
 
-    logger.info("Quarterly deltas fetched for %d tickers", len(deltas))
-
-    # Merge
-    results = []
-    for sym in tickers:
-        q  = quotes.get(sym, {})
-        ra = ratios.get(sym, {})
-        op_delta, gm_delta, rev_growth = deltas.get(sym, (None, None, None))
-
-        if not q:
-            logger.warning("  %s — no quote data", sym)
-            continue
-
-        row = {
-            "ticker":       sym,
-            "price":        q.get("price"),
-            "chg_pct":      q.get("chg_pct"),
-            "mkt_cap":      q.get("mkt_cap"),
-            "pe":           ra.get("pe"),          # TTM P/E from ratios
-            "fwd_pe":       ra.get("fwd_pe"),
-            "peg":          ra.get("peg"),
-            "ps":           ra.get("ps"),
-            "rev_growth":   rev_growth,             # YoY from income statements
-            "gross_margin": ra.get("gross_margin"),
-            "op_margin":    ra.get("op_margin"),
-            "op_delta":     op_delta,
-            "gm_delta":     gm_delta,
-        }
-        results.append(row)
-        logger.info(
-            "  %s ✓  $%.2f  P/E: %s  RevG: %s  OpMgn: %s",
-            sym,
-            q.get("price") or 0,
-            f"{row['pe']:.1f}"              if row["pe"]         is not None else "—",
-            f"{row['rev_growth']*100:.1f}%" if row["rev_growth"] is not None else "—",
-            f"{row['op_margin']*100:.1f}%"  if row["op_margin"]  is not None else "—",
-        )
-
+    # Return in original ticker order
+    order = {sym: i for i, sym in enumerate(tickers)}
+    results.sort(key=lambda r: order.get(r["ticker"], 9999))
     return results
