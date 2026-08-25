@@ -170,6 +170,53 @@ def _fetch_ratios(symbol: str) -> dict:
     }
 
 
+def _fetch_price_target(symbol: str) -> dict:
+    """Fetch analyst consensus price target from FMP."""
+    data = _fmp_get(f"{FMP_STABLE}/price-target-consensus", {"symbol": symbol.upper()})
+    if isinstance(data, list) and data:
+        d = data[0]
+    elif isinstance(data, dict):
+        d = data
+    else:
+        return {}
+    avg_pt = _safe_float(
+        d.get("targetConsensus") or d.get("averageTargetPrice") or d.get("priceTarget")
+    )
+    return {"avg_pt": avg_pt}
+
+
+def _fetch_earnings_surprises(symbol: str, limit: int = 4) -> list:
+    """Fetch last N quarters of EPS/revenue actual vs estimate from FMP."""
+    data = _fmp_get(
+        f"{FMP_STABLE}/earnings-surprises",
+        {"symbol": symbol.upper(), "limit": limit}
+    )
+    if not isinstance(data, list):
+        return []
+    result = []
+    for row in data[:limit]:
+        actual = _safe_float(row.get("actualEarningResult"))
+        est    = _safe_float(row.get("estimatedEarning"))
+        eps_surp = None
+        if actual is not None and est is not None and est != 0:
+            eps_surp = round((actual - est) / abs(est) * 100, 1)
+        rev_actual = _safe_float(row.get("revenueActual") or row.get("actualRevenue"))
+        rev_est    = _safe_float(row.get("revenueEstimated") or row.get("estimatedRevenue"))
+        rev_surp   = None
+        if rev_actual is not None and rev_est is not None and rev_est != 0:
+            rev_surp = round((rev_actual - rev_est) / abs(rev_est) * 100, 1)
+        result.append({
+            "date":       row.get("date", ""),
+            "eps_actual": actual,
+            "eps_est":    est,
+            "eps_surp":   eps_surp,
+            "rev_actual": rev_actual,
+            "rev_est":    rev_est,
+            "rev_surp":   rev_surp,
+        })
+    return result
+
+
 def _fetch_income(symbol: str) -> dict:
     """
     Fetch last 8 quarterly income statements and compute:
@@ -262,18 +309,20 @@ def _fetch_all(symbol: str) -> dict:
       so P is always fresh and E reflects FMP's authoritative fundamentals data
     - _fetch_income() is retained only for margin/growth columns (not for E)
     """
-    quote  = _fetch_quote(symbol)   # price, chg_pct, mkt_cap, trailing_eps
-    ratios = _fetch_ratios(symbol)  # fwd_pe_fmp, peg_fmp, ps_fmp
-    income = _fetch_income(symbol)  # margins only: gross, op, rev_growth, deltas
+    quote  = _fetch_quote(symbol)        # price, chg_pct, mkt_cap, trailing_eps
+    ratios = _fetch_ratios(symbol)       # fwd_pe_fmp, peg_fmp, ps_fmp
+    income = _fetch_income(symbol)       # margins only: gross, op, rev_growth, deltas
+    pt     = _fetch_price_target(symbol) # analyst consensus price target
 
     price        = quote.get("price")
     mkt_cap      = quote.get("mkt_cap")
     trailing_eps = quote.get("eps")          # FMP-computed trailing EPS (TTM)
 
-    fwd_pe_fmp    = ratios.get("fwd_pe_fmp")
-    peg_fmp       = ratios.get("peg_fmp")
-    ps_fmp        = ratios.get("ps_fmp")
+    fwd_pe_fmp     = ratios.get("fwd_pe_fmp")
+    peg_fmp        = ratios.get("peg_fmp")
+    ps_fmp         = ratios.get("ps_fmp")
     debt_to_equity = ratios.get("debt_to_equity")
+    avg_pt         = pt.get("avg_pt")
 
     # ── Reverse-engineer E denominators from FMP ratios ──────────────────────
     # fwd_eps:  price / forwardPE  →  the E behind FMP's forward multiple
@@ -293,10 +342,15 @@ def _fetch_all(symbol: str) -> dict:
     peg    = round(pe_ttm / eps_growth_pct, 2) if pe_ttm and eps_growth_pct and eps_growth_pct > 0 else None
     ps     = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
 
+    # Price target
+    pt_pct = round((price / avg_pt - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
+
     return {
         "price":          price,
         "chg_pct":        quote.get("chg_pct"),
         "mkt_cap":        mkt_cap,
+        "avg_pt":         round(avg_pt, 2) if avg_pt is not None else None,
+        "pt_pct":         pt_pct,   # positive = stock above target, negative = upside to target
         "pe":             pe_ttm,
         "fwd_pe":         fwd_pe,
         "peg":            peg,

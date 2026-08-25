@@ -12,6 +12,7 @@ Endpoints:
 import threading
 import time
 import logging
+import concurrent.futures
 import hmac
 import hashlib
 import os
@@ -20,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from scanner import scan_tickers, UNIVERSES
+from scanner import scan_tickers, UNIVERSES, _fetch_earnings_surprises
 import db as _db
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -277,6 +278,34 @@ def poll():
             "scanned_at": data["scanned_at"],
         })
     return jsonify({"ready": False, "scanning": scanning})
+
+
+# ── Earnings tracker endpoint ─────────────────────────────────────────────────
+
+@app.route("/api/earnings")
+def get_earnings():
+    """
+    GET /api/earnings?tickers=AAPL,MSFT,NVDA
+    Returns last 4 quarters of EPS/revenue actual vs estimate for each ticker.
+    """
+    tickers_raw = request.args.get("tickers", "")
+    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    if not tickers:
+        return jsonify({"error": "tickers param required (comma-separated)"}), 400
+    tickers = tickers[:80]  # safety cap
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        future_map = {pool.submit(_fetch_earnings_surprises, t): t for t in tickers}
+        for fut in concurrent.futures.as_completed(future_map):
+            ticker = future_map[fut]
+            try:
+                results[ticker] = fut.result()
+            except Exception as exc:
+                logger.warning("earnings fetch error %s: %s", ticker, exc)
+                results[ticker] = []
+
+    return jsonify({"results": results, "count": len(results)})
 
 
 # ── History endpoints ─────────────────────────────────────────────────────────

@@ -59,6 +59,10 @@ class FundamentalsSnapshot(Base):
     peg           = Column(Float)
     ps            = Column(Float)
 
+    # Price target
+    avg_pt        = Column(Float)   # analyst consensus price target ($)
+    pt_pct        = Column(Float)   # % current price is above (+) or below (-) avg PT
+
     # Capital structure
     debt_to_equity = Column(Float)
 
@@ -112,6 +116,8 @@ def save_snapshot(universe: str, results: list):
                 "price":          row.get("price"),
                 "chg_pct":        row.get("chg_pct"),
                 "mkt_cap":        row.get("mkt_cap"),
+                "avg_pt":         row.get("avg_pt"),
+                "pt_pct":         row.get("pt_pct"),
                 "pe":             row.get("pe"),
                 "fwd_pe":         row.get("fwd_pe"),
                 "peg":            row.get("peg"),
@@ -220,6 +226,8 @@ def _row_to_dict(r: FundamentalsSnapshot) -> dict:
         "price":          r.price,
         "chg_pct":        r.chg_pct,
         "mkt_cap":        r.mkt_cap,
+        "avg_pt":         r.avg_pt,
+        "pt_pct":         r.pt_pct,
         "pe":             r.pe,
         "fwd_pe":         r.fwd_pe,
         "peg":            r.peg,
