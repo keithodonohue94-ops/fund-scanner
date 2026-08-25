@@ -164,6 +164,9 @@ def _fetch_ratios(symbol: str) -> dict:
         "ps_fmp": _safe_float(
             r.get("priceToSalesRatioTTM") or r.get("priceToSalesRatio")
         ),
+        "debt_to_equity": _safe_float(
+            r.get("debtToEquity") or r.get("debtEquityRatio")
+        ),
     }
 
 
@@ -267,9 +270,10 @@ def _fetch_all(symbol: str) -> dict:
     mkt_cap      = quote.get("mkt_cap")
     trailing_eps = quote.get("eps")          # FMP-computed trailing EPS (TTM)
 
-    fwd_pe_fmp = ratios.get("fwd_pe_fmp")
-    peg_fmp    = ratios.get("peg_fmp")
-    ps_fmp     = ratios.get("ps_fmp")
+    fwd_pe_fmp    = ratios.get("fwd_pe_fmp")
+    peg_fmp       = ratios.get("peg_fmp")
+    ps_fmp        = ratios.get("ps_fmp")
+    debt_to_equity = ratios.get("debt_to_equity")
 
     # ── Reverse-engineer E denominators from FMP ratios ──────────────────────
     # fwd_eps:  price / forwardPE  →  the E behind FMP's forward multiple
@@ -290,18 +294,19 @@ def _fetch_all(symbol: str) -> dict:
     ps     = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
 
     return {
-        "price":        price,
-        "chg_pct":      quote.get("chg_pct"),
-        "mkt_cap":      mkt_cap,
-        "pe":           pe_ttm,
-        "fwd_pe":       fwd_pe,
-        "peg":          peg,
-        "ps":           ps,
-        "rev_growth":   income.get("rev_growth"),
-        "gross_margin": income.get("gross_margin"),
-        "op_margin":    income.get("op_margin"),
-        "op_delta":     income.get("op_delta"),
-        "gm_delta":     income.get("gm_delta"),
+        "price":          price,
+        "chg_pct":        quote.get("chg_pct"),
+        "mkt_cap":        mkt_cap,
+        "pe":             pe_ttm,
+        "fwd_pe":         fwd_pe,
+        "peg":            peg,
+        "ps":             ps,
+        "debt_to_equity": round(debt_to_equity, 2) if debt_to_equity is not None else None,
+        "rev_growth":     income.get("rev_growth"),
+        "gross_margin":   income.get("gross_margin"),
+        "op_margin":      income.get("op_margin"),
+        "op_delta":       income.get("op_delta"),
+        "gm_delta":       income.get("gm_delta"),
     }
 
 

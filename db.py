@@ -59,6 +59,9 @@ class FundamentalsSnapshot(Base):
     peg           = Column(Float)
     ps            = Column(Float)
 
+    # Capital structure
+    debt_to_equity = Column(Float)
+
     # Growth & margins
     rev_growth    = Column(Float)
     gross_margin  = Column(Float)
@@ -106,18 +109,19 @@ def save_snapshot(universe: str, results: list):
             ).first()
 
             fields = {
-                "price":        row.get("price"),
-                "chg_pct":      row.get("chg_pct"),
-                "mkt_cap":      row.get("mkt_cap"),
-                "pe":           row.get("pe"),
-                "fwd_pe":       row.get("fwd_pe"),
-                "peg":          row.get("peg"),
-                "ps":           row.get("ps"),
-                "rev_growth":   row.get("rev_growth"),
-                "gross_margin": row.get("gross_margin"),
-                "op_margin":    row.get("op_margin"),
-                "op_delta":     row.get("op_delta"),
-                "gm_delta":     row.get("gm_delta"),
+                "price":          row.get("price"),
+                "chg_pct":        row.get("chg_pct"),
+                "mkt_cap":        row.get("mkt_cap"),
+                "pe":             row.get("pe"),
+                "fwd_pe":         row.get("fwd_pe"),
+                "peg":            row.get("peg"),
+                "ps":             row.get("ps"),
+                "debt_to_equity": row.get("debt_to_equity"),
+                "rev_growth":     row.get("rev_growth"),
+                "gross_margin":   row.get("gross_margin"),
+                "op_margin":      row.get("op_margin"),
+                "op_delta":       row.get("op_delta"),
+                "gm_delta":       row.get("gm_delta"),
             }
 
             if existing:
@@ -210,19 +214,20 @@ def get_ticker_list(universe: str | None = None) -> list:
 
 def _row_to_dict(r: FundamentalsSnapshot) -> dict:
     return {
-        "date":         r.snapshot_date.isoformat(),
-        "universe":     r.universe,
-        "ticker":       r.ticker,
-        "price":        r.price,
-        "chg_pct":      r.chg_pct,
-        "mkt_cap":      r.mkt_cap,
-        "pe":           r.pe,
-        "fwd_pe":       r.fwd_pe,
-        "peg":          r.peg,
-        "ps":           r.ps,
-        "rev_growth":   r.rev_growth,
-        "gross_margin": r.gross_margin,
-        "op_margin":    r.op_margin,
-        "op_delta":     r.op_delta,
-        "gm_delta":     r.gm_delta,
+        "date":           r.snapshot_date.isoformat(),
+        "universe":       r.universe,
+        "ticker":         r.ticker,
+        "price":          r.price,
+        "chg_pct":        r.chg_pct,
+        "mkt_cap":        r.mkt_cap,
+        "pe":             r.pe,
+        "fwd_pe":         r.fwd_pe,
+        "peg":            r.peg,
+        "ps":             r.ps,
+        "debt_to_equity": r.debt_to_equity,
+        "rev_growth":     r.rev_growth,
+        "gross_margin":   r.gross_margin,
+        "op_margin":      r.op_margin,
+        "op_delta":       r.op_delta,
+        "gm_delta":       r.gm_delta,
     }
