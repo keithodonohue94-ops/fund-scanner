@@ -197,22 +197,21 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
     """
     sym = symbol.upper()
 
-    # Step 1: find last reported quarter date
-    surprises = _fmp_get(f"{FMP_STABLE}/earnings-surprises", {"symbol": sym, "limit": 8})
+    # Step 1: last reported quarter = most recent date in the income statement
+    # (income statement only contains REPORTED quarters, so data[0].date is the last reported)
+    income_data = _fmp_get(
+        f"{FMP_STABLE}/income-statement",
+        {"symbol": sym, "period": "quarter", "limit": 2}
+    )
     last_reported = ""
-    if isinstance(surprises, list):
-        reported_dates = sorted(
-            [r.get("date", "") for r in surprises if r.get("actualEarningResult") is not None],
-            reverse=True
-        )
-        if reported_dates:
-            last_reported = reported_dates[0]
+    if isinstance(income_data, list) and income_data:
+        last_reported = income_data[0].get("date", "") or ""
     logger.info("[ntm-eps] %s last reported quarter: %s", sym, last_reported or "none")
 
-    # Step 2: get quarterly analyst estimates
+    # Step 2: get quarterly analyst estimates — limit=12 to capture current in-progress fiscal year
     estimates = _fmp_get(
         f"{FMP_STABLE}/analyst-estimates",
-        {"symbol": sym, "period": "quarter", "page": 0, "limit": 8}
+        {"symbol": sym, "period": "quarter", "page": 0, "limit": 20}
     )
     if not isinstance(estimates, list) or not estimates:
         logger.warning("[ntm-eps] %s — no quarterly estimates returned", sym)
