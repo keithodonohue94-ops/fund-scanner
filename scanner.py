@@ -205,12 +205,11 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
         row_date = row.get("date", "") or ""
         if row_date <= today_str:
             continue
-        eps = _safe_float(row.get("estimatedEpsAvg"))
-        logger.info("[analyst-est] %s future period %s → estimatedEpsAvg=%s", symbol, row_date, eps)
+        eps = _safe_float(row.get("epsAvg"))
+        logger.info("[analyst-est] %s future period %s → epsAvg=%s", symbol, row_date, eps)
         if eps and eps > 0:
             return eps
-        # Log all fields so we can see what's actually there
-        logger.warning("[analyst-est] %s period %s — estimatedEpsAvg=%s, keys=%s",
+        logger.warning("[analyst-est] %s period %s — epsAvg=%s, keys=%s",
                        symbol, row_date, eps, list(row.keys()))
         return None
 
