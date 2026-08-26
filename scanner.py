@@ -153,19 +153,31 @@ def _fetch_ratios(symbol: str) -> dict:
         r = data
     else:
         return {}
-    logger.debug("[ratios raw] %s → %s", symbol, {k: v for k, v in r.items() if v is not None})
+    logger.info("[ratios raw] %s → %s", symbol, {k: v for k, v in r.items() if v is not None})
     return {
+        # TTM PE direct from ratios (avoids relying on quote.eps)
+        "pe_fmp": _safe_float(
+            r.get("priceEarningsRatio") or r.get("peRatio") or r.get("priceToEarningsRatio")
+        ),
+        # Forward PE
         "fwd_pe_fmp": _safe_float(
             r.get("forwardPE") or r.get("priceEarningsRatioForward")
+            or r.get("forwardPriceEarningsRatio") or r.get("priceEarningsForward")
         ),
+        # PEG
         "peg_fmp": _safe_float(
-            r.get("pegRatioTTM") or r.get("pegRatio") or r.get("priceToEarningsGrowthRatio")
+            r.get("priceEarningsToGrowthRatio") or r.get("pegRatio")
+            or r.get("pegRatioTTM") or r.get("priceToEarningsGrowthRatio")
         ),
+        # P/S
         "ps_fmp": _safe_float(
             r.get("priceToSalesRatioTTM") or r.get("priceToSalesRatio")
+            or r.get("priceSalesRatio") or r.get("priceToSalesTTM")
         ),
+        # D/E
         "debt_to_equity": _safe_float(
-            r.get("debtToEquity") or r.get("debtEquityRatio")
+            r.get("debtToEquityRatio") or r.get("debtToEquity")
+            or r.get("debtEquityRatio") or r.get("totalDebtToEquity")
         ),
     }
 
@@ -318,11 +330,17 @@ def _fetch_all(symbol: str) -> dict:
     mkt_cap      = quote.get("mkt_cap")
     trailing_eps = quote.get("eps")          # FMP-computed trailing EPS (TTM)
 
+    pe_fmp         = ratios.get("pe_fmp")          # TTM PE direct from ratios endpoint
     fwd_pe_fmp     = ratios.get("fwd_pe_fmp")
     peg_fmp        = ratios.get("peg_fmp")
     ps_fmp         = ratios.get("ps_fmp")
     debt_to_equity = ratios.get("debt_to_equity")
     avg_pt         = pt.get("avg_pt")
+
+    # ── TTM PE: prefer quote EPS, fall back to ratios endpoint value ──────────
+    pe_ttm_raw = (price / trailing_eps) if price and trailing_eps and trailing_eps > 0 else None
+    if pe_ttm_raw is None and pe_fmp and pe_fmp > 0:
+        pe_ttm_raw = pe_fmp   # use FMP's pre-calculated TTM PE directly
 
     # ── Reverse-engineer E denominators from FMP ratios ──────────────────────
     # fwd_eps:  price / forwardPE  →  the E behind FMP's forward multiple
@@ -332,14 +350,14 @@ def _fetch_all(symbol: str) -> dict:
     ttm_rev = (mkt_cap / ps_fmp) if mkt_cap and ps_fmp and ps_fmp > 0 else None
 
     # eps_growth_pct: since PEG = PE_ttm / growth_pct  →  growth_pct = PE_ttm / PEG
-    # compute a provisional pe_ttm using FMP's trailing_eps first
-    pe_ttm_raw = (price / trailing_eps) if price and trailing_eps and trailing_eps > 0 else None
     eps_growth_pct = (pe_ttm_raw / peg_fmp) if pe_ttm_raw and peg_fmp and peg_fmp > 0 else None
 
     # ── Recalculate multiples with live price ─────────────────────────────────
     pe_ttm = round(pe_ttm_raw, 1) if pe_ttm_raw is not None else None
     fwd_pe = round(price / fwd_eps, 1) if price and fwd_eps and fwd_eps > 0 else None
-    peg    = round(pe_ttm / eps_growth_pct, 2) if pe_ttm and eps_growth_pct and eps_growth_pct > 0 else None
+    # PEG: prefer FMP's direct value if our reverse-engineered one is unavailable
+    peg    = round(pe_ttm / eps_growth_pct, 2) if pe_ttm and eps_growth_pct and eps_growth_pct > 0 else (
+             round(peg_fmp, 2) if peg_fmp and peg_fmp > 0 else None)
     ps     = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
 
     # Price target
