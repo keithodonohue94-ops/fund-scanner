@@ -182,6 +182,36 @@ def _fetch_ratios(symbol: str) -> dict:
     }
 
 
+def _fetch_fwd_eps(symbol: str) -> float | None:
+    """
+    Fetch analyst consensus forward EPS from FMP /stable/analyst-estimates.
+    Tries annual period first, falls back to quarterly.
+    Returns the estimated EPS value or None.
+    """
+    for period in ("annual", "quarter"):
+        data = _fmp_get(
+            f"{FMP_STABLE}/analyst-estimates",
+            {"symbol": symbol.upper(), "period": period, "limit": 2}
+        )
+        if not isinstance(data, list) or not data:
+            continue
+        # Take first entry — the nearest future period
+        row = data[0]
+        logger.info("[analyst-est raw] %s (%s) → %s", symbol, period,
+                    {k: v for k, v in row.items() if v is not None})
+        # Try every likely EPS field name
+        eps = _safe_float(
+            row.get("estimatedEpsAvg")
+            or row.get("epsEstimated")
+            or row.get("estimatedEps")
+            or row.get("epsAvg")
+            or row.get("eps")
+        )
+        if eps and eps > 0:
+            return eps
+    return None
+
+
 def _fetch_price_target(symbol: str) -> dict:
     """Fetch analyst consensus price target from FMP."""
     data = _fmp_get(f"{FMP_STABLE}/price-target-consensus", {"symbol": symbol.upper()})
@@ -321,10 +351,11 @@ def _fetch_all(symbol: str) -> dict:
       so P is always fresh and E reflects FMP's authoritative fundamentals data
     - _fetch_income() is retained only for margin/growth columns (not for E)
     """
-    quote  = _fetch_quote(symbol)        # price, chg_pct, mkt_cap, trailing_eps
-    ratios = _fetch_ratios(symbol)       # fwd_pe_fmp, peg_fmp, ps_fmp
-    income = _fetch_income(symbol)       # margins only: gross, op, rev_growth, deltas
-    pt     = _fetch_price_target(symbol) # analyst consensus price target
+    quote   = _fetch_quote(symbol)        # price, chg_pct, mkt_cap, trailing_eps
+    ratios  = _fetch_ratios(symbol)       # pe, peg, ps, de from ratios endpoint
+    fwd_eps = _fetch_fwd_eps(symbol)      # analyst consensus forward EPS
+    income  = _fetch_income(symbol)       # margins only: gross, op, rev_growth, deltas
+    pt      = _fetch_price_target(symbol) # analyst consensus price target
 
     price        = quote.get("price")
     mkt_cap      = quote.get("mkt_cap")
@@ -337,25 +368,27 @@ def _fetch_all(symbol: str) -> dict:
     debt_to_equity = ratios.get("debt_to_equity")
     avg_pt         = pt.get("avg_pt")
 
-    # ── TTM PE: prefer quote EPS, fall back to ratios endpoint value ──────────
+    # ── TTM PE: prefer quote EPS, fall back to pre-calculated ratios PE ───────
     pe_ttm_raw = (price / trailing_eps) if price and trailing_eps and trailing_eps > 0 else None
     if pe_ttm_raw is None and pe_fmp and pe_fmp > 0:
-        pe_ttm_raw = pe_fmp   # use FMP's pre-calculated TTM PE directly
+        pe_ttm_raw = pe_fmp
 
-    # ── Reverse-engineer E denominators from FMP ratios ──────────────────────
-    # fwd_eps:  price / forwardPE  →  the E behind FMP's forward multiple
-    fwd_eps = (price / fwd_pe_fmp) if price and fwd_pe_fmp and fwd_pe_fmp > 0 else None
+    # ── Forward PE: live price / analyst consensus fwd EPS ───────────────────
+    # fwd_eps comes from _fetch_fwd_eps() (analyst-estimates endpoint)
+    # fwd_pe_fmp is the ratios endpoint's forward PE attempt (usually null)
+    effective_fwd_eps = fwd_eps or (
+        (price / fwd_pe_fmp) if price and fwd_pe_fmp and fwd_pe_fmp > 0 else None
+    )
 
-    # ttm_rev:  mkt_cap / P/S  →  absolute TTM revenue
+    # ── TTM revenue from P/S ratio ────────────────────────────────────────────
     ttm_rev = (mkt_cap / ps_fmp) if mkt_cap and ps_fmp and ps_fmp > 0 else None
 
-    # eps_growth_pct: since PEG = PE_ttm / growth_pct  →  growth_pct = PE_ttm / PEG
+    # ── EPS growth: derived from PEG = PE / growth% ──────────────────────────
     eps_growth_pct = (pe_ttm_raw / peg_fmp) if pe_ttm_raw and peg_fmp and peg_fmp > 0 else None
 
-    # ── Recalculate multiples with live price ─────────────────────────────────
+    # ── Final multiples ───────────────────────────────────────────────────────
     pe_ttm = round(pe_ttm_raw, 1) if pe_ttm_raw is not None else None
-    fwd_pe = round(price / fwd_eps, 1) if price and fwd_eps and fwd_eps > 0 else None
-    # PEG: prefer FMP's direct value if our reverse-engineered one is unavailable
+    fwd_pe = round(price / effective_fwd_eps, 1) if price and effective_fwd_eps and effective_fwd_eps > 0 else None
     peg    = round(pe_ttm / eps_growth_pct, 2) if pe_ttm and eps_growth_pct and eps_growth_pct > 0 else (
              round(peg_fmp, 2) if peg_fmp and peg_fmp > 0 else None)
     ps     = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
