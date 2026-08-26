@@ -184,42 +184,38 @@ def _fetch_ratios(symbol: str) -> dict:
 
 def _fetch_fwd_eps(symbol: str) -> float | None:
     """
-    Fetch analyst consensus forward annual EPS from FMP /stable/analyst-estimates.
-    Only returns estimates for future fiscal periods (date > today).
-    Logs all fields so we can verify the correct field name.
+    Fetch analyst consensus forward annual EPS.
+    Uses FMP v3 /analyst-estimates/{symbol} endpoint (stable API doesn't support this).
+    Returns the nearest future fiscal year's estimatedEpsAvg, or None.
     """
     from datetime import date as _date
     today_str = _date.today().isoformat()
 
-    data = _fmp_get(
-        f"{FMP_STABLE}/analyst-estimates",
-        {"symbol": symbol.upper(), "period": "annual", "limit": 4}
-    )
+    url = f"https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol.upper()}"
+    data = _fmp_get(url, {"period": "annual", "limit": 4})
+
     if not isinstance(data, list) or not data:
-        logger.warning("[analyst-est] %s — no data returned", symbol)
+        logger.warning("[analyst-est] %s — no data from v3 endpoint", symbol)
         return None
 
-    # Log all rows so we can see dates and field names
-    for row in data:
-        logger.info("[analyst-est] %s date=%s fields=%s",
-                    symbol, row.get("date"), {k: v for k, v in row.items() if v is not None})
+    logger.info("[analyst-est] %s — %d rows, dates: %s",
+                symbol, len(data), [r.get("date") for r in data])
 
-    # Find nearest future fiscal year end
     for row in data:
         row_date = row.get("date", "") or ""
         if row_date <= today_str:
-            logger.info("[analyst-est] %s skipping past/current period %s", symbol, row_date)
             continue
-        # FMP stable API field for consensus forward EPS
         eps = _safe_float(row.get("estimatedEpsAvg"))
-        logger.info("[analyst-est] %s using period %s → estimatedEpsAvg=%s", symbol, row_date, eps)
+        logger.info("[analyst-est] %s future period %s → estimatedEpsAvg=%s", symbol, row_date, eps)
         if eps and eps > 0:
             return eps
-        logger.warning("[analyst-est] %s period %s — estimatedEpsAvg missing or zero, all fields: %s",
-                       symbol, row_date, list(row.keys()))
-        return None  # found the right period but no EPS — don't keep searching
+        # Log all fields so we can see what's actually there
+        logger.warning("[analyst-est] %s period %s — estimatedEpsAvg=%s, keys=%s",
+                       symbol, row_date, eps, list(row.keys()))
+        return None
 
-    logger.warning("[analyst-est] %s — no future annual period found in %d rows", symbol, len(data))
+    logger.warning("[analyst-est] %s — no future period in %d rows: %s",
+                   symbol, len(data), [r.get("date") for r in data])
     return None
 
 
