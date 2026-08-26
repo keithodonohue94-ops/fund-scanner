@@ -191,8 +191,8 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
     from datetime import date as _date
     today_str = _date.today().isoformat()
 
-    url = f"https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol.upper()}"
-    data = _fmp_get(url, {"period": "annual", "limit": 4})
+    url = f"{FMP_STABLE}/analyst-estimates"
+    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "annual", "page": 0, "limit": 4})
 
     if not isinstance(data, list) or not data:
         logger.warning("[analyst-est] %s — no data from v3 endpoint", symbol)
