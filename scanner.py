@@ -192,7 +192,7 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
     today_str = _date.today().isoformat()
 
     url = f"{FMP_STABLE}/analyst-estimates"
-    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "annual", "page": 0, "limit": 4})
+    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "annual", "page": 0, "limit": 8})
 
     if not isinstance(data, list) or not data:
         logger.warning("[analyst-est] %s — no data from v3 endpoint", symbol)
@@ -201,12 +201,15 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
     logger.info("[analyst-est] %s — %d rows, dates: %s",
                 symbol, len(data), [r.get("date") for r in data])
 
-    for row in data:
+    # Sort ascending so we pick the NEAREST future fiscal year, not the furthest
+    data_sorted = sorted(data, key=lambda r: r.get("date", ""))
+
+    for row in data_sorted:
         row_date = row.get("date", "") or ""
         if row_date <= today_str:
             continue
         eps = _safe_float(row.get("epsAvg"))
-        logger.info("[analyst-est] %s future period %s → epsAvg=%s", symbol, row_date, eps)
+        logger.info("[analyst-est] %s nearest future period %s → epsAvg=%s", symbol, row_date, eps)
         if eps and eps > 0:
             return eps
         logger.warning("[analyst-est] %s period %s — epsAvg=%s, keys=%s",
