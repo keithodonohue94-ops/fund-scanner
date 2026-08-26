@@ -184,41 +184,66 @@ def _fetch_ratios(symbol: str) -> dict:
 
 def _fetch_fwd_eps(symbol: str) -> float | None:
     """
-    Fetch analyst consensus forward annual EPS.
-    Uses FMP v3 /analyst-estimates/{symbol} endpoint (stable API doesn't support this).
-    Returns the nearest future fiscal year's estimatedEpsAvg, or None.
+    Compute NTM (Next Twelve Months) EPS — the street-standard forward EPS.
+
+    Method:
+      1. Get last reported quarter date from earnings-surprises (actual result = reported)
+      2. Get next 8 quarters of analyst estimates
+      3. Filter to quarters AFTER last reported date (unreported = forward)
+      4. Take nearest 4 forward quarters, sum their epsAvg = NTM EPS
+
+    Auto-rolls: once a quarter is reported it appears in earnings-surprises,
+    shifts the cutoff forward, and the next out-quarter is included automatically.
     """
-    from datetime import date as _date
-    today_str = _date.today().isoformat()
+    sym = symbol.upper()
 
-    url = f"{FMP_STABLE}/analyst-estimates"
-    data = _fmp_get(url, {"symbol": symbol.upper(), "period": "annual", "page": 0, "limit": 8})
+    # Step 1: find last reported quarter date
+    surprises = _fmp_get(f"{FMP_STABLE}/earnings-surprises", {"symbol": sym, "limit": 8})
+    last_reported = ""
+    if isinstance(surprises, list):
+        reported_dates = sorted(
+            [r.get("date", "") for r in surprises if r.get("actualEarningResult") is not None],
+            reverse=True
+        )
+        if reported_dates:
+            last_reported = reported_dates[0]
+    logger.info("[ntm-eps] %s last reported quarter: %s", sym, last_reported or "none")
 
-    if not isinstance(data, list) or not data:
-        logger.warning("[analyst-est] %s — no data from v3 endpoint", symbol)
+    # Step 2: get quarterly analyst estimates
+    estimates = _fmp_get(
+        f"{FMP_STABLE}/analyst-estimates",
+        {"symbol": sym, "period": "quarter", "page": 0, "limit": 8}
+    )
+    if not isinstance(estimates, list) or not estimates:
+        logger.warning("[ntm-eps] %s — no quarterly estimates returned", sym)
         return None
 
-    logger.info("[analyst-est] %s — %d rows, dates: %s",
-                symbol, len(data), [r.get("date") for r in data])
+    logger.info("[ntm-eps] %s — %d estimate rows, dates: %s",
+                sym, len(estimates), [r.get("date") for r in estimates])
 
-    # Sort ascending so we pick the NEAREST future fiscal year, not the furthest
-    data_sorted = sorted(data, key=lambda r: r.get("date", ""))
+    # Step 3: filter to unreported forward quarters (date > last reported)
+    forward = sorted(
+        [r for r in estimates if (r.get("date") or "") > last_reported],
+        key=lambda r: r.get("date", "")
+    )
 
-    for row in data_sorted:
-        row_date = row.get("date", "") or ""
-        if row_date <= today_str:
-            continue
-        eps = _safe_float(row.get("epsAvg"))
-        logger.info("[analyst-est] %s nearest future period %s → epsAvg=%s", symbol, row_date, eps)
-        if eps and eps > 0:
-            return eps
-        logger.warning("[analyst-est] %s period %s — epsAvg=%s, keys=%s",
-                       symbol, row_date, eps, list(row.keys()))
+    if not forward:
+        logger.warning("[ntm-eps] %s — no forward quarters after %s", sym, last_reported)
         return None
 
-    logger.warning("[analyst-est] %s — no future period in %d rows: %s",
-                   symbol, len(data), [r.get("date") for r in data])
-    return None
+    # Step 4: sum nearest 4 forward quarters = NTM EPS
+    next4 = forward[:4]
+    eps_values = [_safe_float(r.get("epsAvg")) for r in next4]
+    logger.info("[ntm-eps] %s next 4 quarters: %s → epsAvg: %s",
+                sym, [r.get("date") for r in next4], eps_values)
+
+    if not any(v is not None for v in eps_values):
+        logger.warning("[ntm-eps] %s — epsAvg missing in all forward quarters", sym)
+        return None
+
+    ntm_eps = sum(v for v in eps_values if v is not None)
+    logger.info("[ntm-eps] %s NTM EPS = %.4f", sym, ntm_eps)
+    return ntm_eps if ntm_eps > 0 else None
 
 
 def _fetch_price_target(symbol: str) -> dict:
