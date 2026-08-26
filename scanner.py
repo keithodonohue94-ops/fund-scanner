@@ -184,31 +184,42 @@ def _fetch_ratios(symbol: str) -> dict:
 
 def _fetch_fwd_eps(symbol: str) -> float | None:
     """
-    Fetch analyst consensus forward EPS from FMP /stable/analyst-estimates.
-    Tries annual period first, falls back to quarterly.
-    Returns the estimated EPS value or None.
+    Fetch analyst consensus forward annual EPS from FMP /stable/analyst-estimates.
+    Only returns estimates for future fiscal periods (date > today).
+    Logs all fields so we can verify the correct field name.
     """
-    for period in ("annual", "quarter"):
-        data = _fmp_get(
-            f"{FMP_STABLE}/analyst-estimates",
-            {"symbol": symbol.upper(), "period": period, "limit": 2}
-        )
-        if not isinstance(data, list) or not data:
+    from datetime import date as _date
+    today_str = _date.today().isoformat()
+
+    data = _fmp_get(
+        f"{FMP_STABLE}/analyst-estimates",
+        {"symbol": symbol.upper(), "period": "annual", "limit": 4}
+    )
+    if not isinstance(data, list) or not data:
+        logger.warning("[analyst-est] %s — no data returned", symbol)
+        return None
+
+    # Log all rows so we can see dates and field names
+    for row in data:
+        logger.info("[analyst-est] %s date=%s fields=%s",
+                    symbol, row.get("date"), {k: v for k, v in row.items() if v is not None})
+
+    # Find nearest future fiscal year end
+    for row in data:
+        row_date = row.get("date", "") or ""
+        if row_date <= today_str:
+            logger.info("[analyst-est] %s skipping past/current period %s", symbol, row_date)
             continue
-        # Take first entry — the nearest future period
-        row = data[0]
-        logger.info("[analyst-est raw] %s (%s) → %s", symbol, period,
-                    {k: v for k, v in row.items() if v is not None})
-        # Try every likely EPS field name
-        eps = _safe_float(
-            row.get("estimatedEpsAvg")
-            or row.get("epsEstimated")
-            or row.get("estimatedEps")
-            or row.get("epsAvg")
-            or row.get("eps")
-        )
+        # FMP stable API field for consensus forward EPS
+        eps = _safe_float(row.get("estimatedEpsAvg"))
+        logger.info("[analyst-est] %s using period %s → estimatedEpsAvg=%s", symbol, row_date, eps)
         if eps and eps > 0:
             return eps
+        logger.warning("[analyst-est] %s period %s — estimatedEpsAvg missing or zero, all fields: %s",
+                       symbol, row_date, list(row.keys()))
+        return None  # found the right period but no EPS — don't keep searching
+
+    logger.warning("[analyst-est] %s — no future annual period found in %d rows", symbol, len(data))
     return None
 
 
@@ -359,26 +370,28 @@ def _fetch_all(symbol: str) -> dict:
 
     price        = quote.get("price")
     mkt_cap      = quote.get("mkt_cap")
-    trailing_eps = quote.get("eps")          # FMP-computed trailing EPS (TTM)
+    quote_eps    = quote.get("eps")          # FMP quote trailing EPS (sometimes wrong)
+    income_eps   = income.get("ttm_eps")    # Our own 4-quarter sum — more reliable
 
     pe_fmp         = ratios.get("pe_fmp")          # TTM PE direct from ratios endpoint
-    fwd_pe_fmp     = ratios.get("fwd_pe_fmp")
     peg_fmp        = ratios.get("peg_fmp")
     ps_fmp         = ratios.get("ps_fmp")
     debt_to_equity = ratios.get("debt_to_equity")
     avg_pt         = pt.get("avg_pt")
 
-    # ── TTM PE: prefer quote EPS, fall back to pre-calculated ratios PE ───────
+    # ── TTM PE: prefer our own 4-quarter EPS sum, fall back to quote eps, then ratios ──
+    # income_eps (sum of 4 quarters from income statement) is more reliable than
+    # the quote.eps field which can reflect GAAP adjustments or stale data
+    trailing_eps = income_eps or quote_eps
     pe_ttm_raw = (price / trailing_eps) if price and trailing_eps and trailing_eps > 0 else None
     if pe_ttm_raw is None and pe_fmp and pe_fmp > 0:
         pe_ttm_raw = pe_fmp
+    logger.info("[pe-debug] %s income_eps=%s quote_eps=%s pe_ttm_raw=%s",
+                symbol, income_eps, quote_eps, pe_ttm_raw)
 
-    # ── Forward PE: live price / analyst consensus fwd EPS ───────────────────
-    # fwd_eps comes from _fetch_fwd_eps() (analyst-estimates endpoint)
-    # fwd_pe_fmp is the ratios endpoint's forward PE attempt (usually null)
-    effective_fwd_eps = fwd_eps or (
-        (price / fwd_pe_fmp) if price and fwd_pe_fmp and fwd_pe_fmp > 0 else None
-    )
+    # ── Forward PE: price / forward annual EPS (direct, no derivation) ──────
+    effective_fwd_eps = fwd_eps  # from analyst-estimates, future period only
+    logger.info("[fwd-pe-debug] %s fwd_eps=%s", symbol, fwd_eps)
 
     # ── TTM revenue from P/S ratio ────────────────────────────────────────────
     ttm_rev = (mkt_cap / ps_fmp) if mkt_cap and ps_fmp and ps_fmp > 0 else None
