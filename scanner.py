@@ -182,23 +182,24 @@ def _fetch_ratios(symbol: str) -> dict:
     }
 
 
-def _fetch_fwd_eps(symbol: str) -> float | None:
+def _fetch_fwd_eps(symbol: str) -> dict:
     """
-    Compute NTM (Next Twelve Months) EPS — the street-standard forward EPS.
+    Compute NTM (Next Twelve Months) EPS and return forward quarter data for PEG calculation.
 
     Method:
-      1. Get last reported quarter date from earnings-surprises (actual result = reported)
-      2. Get next 8 quarters of analyst estimates
-      3. Filter to quarters AFTER last reported date (unreported = forward)
-      4. Take nearest 4 forward quarters, sum their epsAvg = NTM EPS
+      1. Get last reported quarter date from income statement
+      2. Get quarterly analyst estimates (limit=20 to cover NTM + 4 years beyond)
+      3. Filter to unreported forward quarters (date > last reported)
+      4. NTM EPS = sum of nearest 4 forward quarters
+      5. beyond_ntm = remaining forward quarters after NTM window (used for PEG CAGR)
 
-    Auto-rolls: once a quarter is reported it appears in earnings-surprises,
-    shifts the cutoff forward, and the next out-quarter is included automatically.
+    Returns dict with:
+      ntm_eps    — float or None
+      beyond_ntm — list of quarterly estimate rows sorted ascending by date
     """
     sym = symbol.upper()
 
     # Step 1: last reported quarter = most recent date in the income statement
-    # (income statement only contains REPORTED quarters, so data[0].date is the last reported)
     income_data = _fmp_get(
         f"{FMP_STABLE}/income-statement",
         {"symbol": sym, "period": "quarter", "limit": 2}
@@ -208,19 +209,19 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
         last_reported = income_data[0].get("date", "") or ""
     logger.info("[ntm-eps] %s last reported quarter: %s", sym, last_reported or "none")
 
-    # Step 2: get quarterly analyst estimates — limit=12 to capture current in-progress fiscal year
+    # Step 2: get quarterly analyst estimates — limit=20 covers NTM + up to 4 years beyond
     estimates = _fmp_get(
         f"{FMP_STABLE}/analyst-estimates",
         {"symbol": sym, "period": "quarter", "page": 0, "limit": 20}
     )
     if not isinstance(estimates, list) or not estimates:
         logger.warning("[ntm-eps] %s — no quarterly estimates returned", sym)
-        return None
+        return {"ntm_eps": None, "beyond_ntm": []}
 
     logger.info("[ntm-eps] %s — %d estimate rows, dates: %s",
                 sym, len(estimates), [r.get("date") for r in estimates])
 
-    # Step 3: filter to unreported forward quarters (date > last reported)
+    # Step 3: filter to unreported forward quarters (date > last reported), sort ascending
     forward = sorted(
         [r for r in estimates if (r.get("date") or "") > last_reported],
         key=lambda r: r.get("date", "")
@@ -228,7 +229,7 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
 
     if not forward:
         logger.warning("[ntm-eps] %s — no forward quarters after %s", sym, last_reported)
-        return None
+        return {"ntm_eps": None, "beyond_ntm": []}
 
     # Step 4: sum nearest 4 forward quarters = NTM EPS
     next4 = forward[:4]
@@ -238,11 +239,65 @@ def _fetch_fwd_eps(symbol: str) -> float | None:
 
     if not any(v is not None for v in eps_values):
         logger.warning("[ntm-eps] %s — epsAvg missing in all forward quarters", sym)
-        return None
+        return {"ntm_eps": None, "beyond_ntm": []}
 
     ntm_eps = sum(v for v in eps_values if v is not None)
     logger.info("[ntm-eps] %s NTM EPS = %.4f", sym, ntm_eps)
-    return ntm_eps if ntm_eps > 0 else None
+
+    # Step 5: quarters beyond NTM window — used for PEG CAGR
+    beyond_ntm = forward[4:]
+    logger.info("[ntm-eps] %s beyond-NTM quarters: %d → %s",
+                sym, len(beyond_ntm), [r.get("date") for r in beyond_ntm])
+
+    return {
+        "ntm_eps":    ntm_eps if ntm_eps > 0 else None,
+        "beyond_ntm": beyond_ntm,
+    }
+
+
+def _compute_peg(fwd_pe: float, ntm_eps: float, beyond_ntm: list, symbol: str = "") -> float | None:
+    """
+    Compute forward PEG using quarter-based CAGR beyond the NTM window.
+
+    Method:
+      - Count complete years of quarterly estimates beyond NTM: n = len(beyond_ntm) // 4
+      - Require n >= 2 (at least 2 full years of visibility)
+      - Terminal EPS = sum of the nth year's 4 quarters
+      - CAGR = (terminal_eps / ntm_eps) ** (1/n) - 1
+      - PEG  = fwd_pe / (cagr * 100)
+    """
+    if not fwd_pe or not ntm_eps or ntm_eps <= 0 or not beyond_ntm:
+        return None
+
+    n = len(beyond_ntm) // 4
+    if n < 2:
+        logger.info("[peg] %s — only %d complete years beyond NTM, need ≥2", symbol, n)
+        return None
+
+    usable = beyond_ntm[:n * 4]
+    terminal_quarters = usable[-4:]
+    terminal_values = [_safe_float(r.get("epsAvg")) for r in terminal_quarters]
+
+    if not any(v is not None for v in terminal_values):
+        logger.warning("[peg] %s — epsAvg missing in terminal quarters", symbol)
+        return None
+
+    terminal_eps = sum(v for v in terminal_values if v is not None)
+    if terminal_eps <= 0:
+        logger.info("[peg] %s — terminal EPS non-positive (%.4f)", symbol, terminal_eps)
+        return None
+
+    cagr = (terminal_eps / ntm_eps) ** (1 / n) - 1
+    cagr_pct = cagr * 100
+
+    logger.info("[peg] %s ntm_eps=%.4f terminal_eps=%.4f n=%d cagr=%.1f%% fwd_pe=%.1f peg=%.2f",
+                symbol, ntm_eps, terminal_eps, n, cagr_pct, fwd_pe,
+                fwd_pe / cagr_pct if cagr_pct > 0 else 0)
+
+    if cagr_pct <= 0:
+        return None
+
+    return round(fwd_pe / cagr_pct, 2)
 
 
 def _fetch_price_target(symbol: str) -> dict:
@@ -384,26 +439,26 @@ def _fetch_all(symbol: str) -> dict:
       so P is always fresh and E reflects FMP's authoritative fundamentals data
     - _fetch_income() is retained only for margin/growth columns (not for E)
     """
-    quote   = _fetch_quote(symbol)        # price, chg_pct, mkt_cap, trailing_eps
-    ratios  = _fetch_ratios(symbol)       # pe, peg, ps, de from ratios endpoint
-    fwd_eps = _fetch_fwd_eps(symbol)      # analyst consensus forward EPS
-    income  = _fetch_income(symbol)       # margins only: gross, op, rev_growth, deltas
-    pt      = _fetch_price_target(symbol) # analyst consensus price target
+    quote    = _fetch_quote(symbol)        # price, chg_pct, mkt_cap, trailing_eps
+    ratios   = _fetch_ratios(symbol)       # pe, ps, de from ratios endpoint
+    ntm_data = _fetch_fwd_eps(symbol)      # ntm_eps + beyond_ntm quarters
+    income   = _fetch_income(symbol)       # margins only: gross, op, rev_growth, deltas
+    pt       = _fetch_price_target(symbol) # analyst consensus price target
 
     price        = quote.get("price")
     mkt_cap      = quote.get("mkt_cap")
-    quote_eps    = quote.get("eps")          # FMP quote trailing EPS (sometimes wrong)
-    income_eps   = income.get("ttm_eps")    # Our own 4-quarter sum — more reliable
+    quote_eps    = quote.get("eps")        # FMP quote trailing EPS (sometimes wrong)
+    income_eps   = income.get("ttm_eps")   # Our own 4-quarter sum — more reliable
 
-    pe_fmp         = ratios.get("pe_fmp")          # TTM PE direct from ratios endpoint
-    peg_fmp        = ratios.get("peg_fmp")
+    fwd_eps    = ntm_data.get("ntm_eps")
+    beyond_ntm = ntm_data.get("beyond_ntm", [])
+
+    pe_fmp         = ratios.get("pe_fmp")
     ps_fmp         = ratios.get("ps_fmp")
     debt_to_equity = ratios.get("debt_to_equity")
     avg_pt         = pt.get("avg_pt")
 
     # ── TTM PE: prefer our own 4-quarter EPS sum, fall back to quote eps, then ratios ──
-    # income_eps (sum of 4 quarters from income statement) is more reliable than
-    # the quote.eps field which can reflect GAAP adjustments or stale data
     trailing_eps = income_eps or quote_eps
     pe_ttm_raw = (price / trailing_eps) if price and trailing_eps and trailing_eps > 0 else None
     if pe_ttm_raw is None and pe_fmp and pe_fmp > 0:
@@ -411,22 +466,20 @@ def _fetch_all(symbol: str) -> dict:
     logger.info("[pe-debug] %s income_eps=%s quote_eps=%s pe_ttm_raw=%s",
                 symbol, income_eps, quote_eps, pe_ttm_raw)
 
-    # ── Forward PE: price / forward annual EPS (direct, no derivation) ──────
-    effective_fwd_eps = fwd_eps  # from analyst-estimates, future period only
+    # ── Forward PE: price / NTM EPS (direct, no fallback) ────────────────────
     logger.info("[fwd-pe-debug] %s fwd_eps=%s", symbol, fwd_eps)
 
     # ── TTM revenue from P/S ratio ────────────────────────────────────────────
     ttm_rev = (mkt_cap / ps_fmp) if mkt_cap and ps_fmp and ps_fmp > 0 else None
 
-    # ── EPS growth: derived from PEG = PE / growth% ──────────────────────────
-    eps_growth_pct = (pe_ttm_raw / peg_fmp) if pe_ttm_raw and peg_fmp and peg_fmp > 0 else None
-
     # ── Final multiples ───────────────────────────────────────────────────────
     pe_ttm = round(pe_ttm_raw, 1) if pe_ttm_raw is not None else None
-    fwd_pe = round(price / effective_fwd_eps, 1) if price and effective_fwd_eps and effective_fwd_eps > 0 else None
-    peg    = round(pe_ttm / eps_growth_pct, 2) if pe_ttm and eps_growth_pct and eps_growth_pct > 0 else (
-             round(peg_fmp, 2) if peg_fmp and peg_fmp > 0 else None)
-    ps     = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
+    fwd_pe = round(price / fwd_eps, 1) if price and fwd_eps and fwd_eps > 0 else None
+
+    # PEG: forward PE / n-year CAGR from NTM EPS base to terminal (quarter-based)
+    peg = _compute_peg(fwd_pe, fwd_eps, beyond_ntm, symbol=symbol)
+
+    ps = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
 
     # Price target
     pt_pct = round((price / avg_pt - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
@@ -458,7 +511,7 @@ def scan_tickers(tickers: list, delay: float = 0) -> list:
     All multiples are calculated from live price and raw fundamental data:
       P/E TTM  = price / TTM EPS (sum of last 4 quarters)
       FWD P/E  = price / analyst consensus fwd EPS
-      PEG      = P/E TTM / (YoY EPS growth %)
+      PEG      = FWD P/E / n-year EPS CAGR (quarter-based, NTM EPS as base)
       P/S      = market cap / TTM revenue
     """
     if not FMP_API_KEY:
