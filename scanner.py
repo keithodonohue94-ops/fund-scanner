@@ -323,15 +323,24 @@ def _fetch_earnings_surprises(symbol: str, limit: int = 4) -> list:
     )
     if not isinstance(data, list):
         return []
+    def _pick(row, *keys):
+        """Return _safe_float of first key that is present and not None (handles 0 correctly)."""
+        for k in keys:
+            raw = row.get(k)
+            if raw is not None:
+                return _safe_float(raw)
+        return None
+
     result = []
     for row in data[:limit]:
-        actual = _safe_float(row.get("eps") or row.get("actualEps") or row.get("actualEarningResult"))
-        est    = _safe_float(row.get("epsEstimated") or row.get("estimatedEps") or row.get("estimatedEarning"))
+        logger.debug("[earnings raw] %s", {k: v for k, v in row.items()})
+        actual = _pick(row, "eps", "actualEps", "actualEarningResult")
+        est    = _pick(row, "epsEstimated", "estimatedEps", "estimatedEarning")
         eps_surp = None
         if actual is not None and est is not None and est != 0:
             eps_surp = round((actual - est) / abs(est) * 100, 1)
-        rev_actual = _safe_float(row.get("revenue") or row.get("revenueActual") or row.get("actualRevenue"))
-        rev_est    = _safe_float(row.get("revenueEstimated") or row.get("estimatedRevenue"))
+        rev_actual = _pick(row, "revenue", "revenueActual", "actualRevenue")
+        rev_est    = _pick(row, "revenueEstimated", "estimatedRevenue")
         rev_surp   = None
         if rev_actual is not None and rev_est is not None and rev_est != 0:
             rev_surp = round((rev_actual - rev_est) / abs(rev_est) * 100, 1)
