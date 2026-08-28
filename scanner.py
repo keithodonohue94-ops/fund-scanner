@@ -331,9 +331,18 @@ def _fetch_earnings_surprises(symbol: str, limit: int = 8) -> list:
                 return _safe_float(raw)
         return None
 
+    from datetime import date as _date
+    today_str = str(_date.today())
+
     result = []
     for row in data[:limit]:
-        logger.debug("[earnings raw] %s", {k: v for k, v in row.items()})
+        logger.info("[earnings raw] %s %s", symbol, {k: v for k, v in row.items() if k in (
+            "date", "eps", "epsEstimated", "actualEarningResult", "estimatedEarning",
+            "revenue", "revenueEstimated", "actualRevenue", "revenueActual",
+        )})
+        date_str = row.get("date", "")
+        is_upcoming = bool(date_str) and date_str > today_str
+
         actual = _pick(row, "eps", "actualEps", "actualEarningResult")
         est    = _pick(row, "epsEstimated", "estimatedEps", "estimatedEarning")
         eps_surp = None
@@ -344,14 +353,17 @@ def _fetch_earnings_surprises(symbol: str, limit: int = 8) -> list:
         rev_surp   = None
         if rev_actual is not None and rev_est is not None and rev_est != 0:
             rev_surp = round((rev_actual - rev_est) / abs(rev_est) * 100, 1)
+        fiscal_end = row.get("fiscalDateEnding") or row.get("fiscal_date_ending") or date_str
         result.append({
-            "date":       row.get("date", ""),
-            "eps_actual": actual,
-            "eps_est":    est,
-            "eps_surp":   eps_surp,
-            "rev_actual": rev_actual,
-            "rev_est":    rev_est,
-            "rev_surp":   rev_surp,
+            "date":        date_str,    # announcement date — used for upcoming display
+            "fiscal_end":  fiscal_end,  # fiscal period end — used for Q-label grouping
+            "is_upcoming": is_upcoming,
+            "eps_actual":  actual,
+            "eps_est":     est,
+            "eps_surp":    eps_surp,
+            "rev_actual":  rev_actual,
+            "rev_est":     rev_est,
+            "rev_surp":    rev_surp,
         })
     return result
 
@@ -491,7 +503,7 @@ def _fetch_all(symbol: str) -> dict:
     ps = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
 
     # Price target
-    pt_pct = round((price / avg_pt - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
+    pt_pct = round((avg_pt / price - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
 
     return {
         "price":          price,

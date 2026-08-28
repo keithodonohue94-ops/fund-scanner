@@ -302,7 +302,7 @@ def get_price_targets():
         price   = quote.get("price")
         mkt_cap = quote.get("mkt_cap")
         avg_pt  = pt.get("avg_pt")
-        pt_pct  = round((price / avg_pt - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
+        pt_pct  = round((avg_pt / price - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
         ps      = ratios.get("ps_fmp")
         return sym, {"mkt_cap": mkt_cap, "avg_pt": avg_pt, "pt_pct": pt_pct, "ps": ps}
 
@@ -316,11 +316,23 @@ def get_price_targets():
 
 # ── Earnings tracker endpoint ─────────────────────────────────────────────────
 
+@app.route("/api/earnings-raw")
+def get_earnings_raw():
+    """
+    GET /api/earnings-raw?ticker=ALAB
+    Returns raw FMP response for one ticker so we can inspect field names.
+    """
+    symbol = request.args.get("ticker", "ALAB").upper()
+    import scanner as sc
+    data = sc._fmp_get(f"{sc.FMP_STABLE}/earnings", {"symbol": symbol, "limit": 2})
+    return jsonify({"symbol": symbol, "raw": data})
+
+
 @app.route("/api/earnings")
 def get_earnings():
     """
     GET /api/earnings?tickers=AAPL,MSFT,NVDA
-    Returns last 4 quarters of EPS/revenue actual vs estimate for each ticker.
+    Returns last 8 quarters of EPS/revenue actual vs estimate for each ticker.
     """
     tickers_raw = request.args.get("tickers", "")
     tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
