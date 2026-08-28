@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from scanner import scan_tickers, UNIVERSES, _fetch_earnings_surprises
+from scanner import scan_tickers, UNIVERSES, _fetch_earnings_surprises, _fetch_quote, _fetch_price_target, _fetch_ratios
 import db as _db
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -296,13 +296,15 @@ def get_price_targets():
     tickers = tickers[:80]
 
     def _fetch_pt(sym):
-        quote = _fetch_quote(sym)
-        pt    = _fetch_price_target(sym)
-        price    = quote.get("price")
-        mkt_cap  = quote.get("mkt_cap")
-        avg_pt   = pt.get("avg_pt")
-        pt_pct   = round((price / avg_pt - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
-        return sym, {"mkt_cap": mkt_cap, "avg_pt": avg_pt, "pt_pct": pt_pct}
+        quote  = _fetch_quote(sym)
+        pt     = _fetch_price_target(sym)
+        ratios = _fetch_ratios(sym)
+        price   = quote.get("price")
+        mkt_cap = quote.get("mkt_cap")
+        avg_pt  = pt.get("avg_pt")
+        pt_pct  = round((price / avg_pt - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
+        ps      = ratios.get("ps_fmp")
+        return sym, {"mkt_cap": mkt_cap, "avg_pt": avg_pt, "pt_pct": pt_pct, "ps": ps}
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
