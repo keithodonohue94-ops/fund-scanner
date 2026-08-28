@@ -315,7 +315,7 @@ def _fetch_price_target(symbol: str) -> dict:
     return {"avg_pt": avg_pt}
 
 
-def _fetch_earnings_surprises(symbol: str, limit: int = 4) -> list:
+def _fetch_earnings_surprises(symbol: str, limit: int = 8) -> list:
     """Fetch last N quarters of EPS/revenue actual vs estimate from FMP stable earnings endpoint."""
     data = _fmp_get(
         f"{FMP_STABLE}/earnings",
