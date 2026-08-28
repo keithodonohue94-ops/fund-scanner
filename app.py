@@ -280,6 +280,38 @@ def poll():
     return jsonify({"ready": False, "scanning": scanning})
 
 
+# ── Price targets endpoint (lightweight — mkt cap + avg PT per ticker) ───────
+
+@app.route("/api/price-targets")
+def get_price_targets():
+    """
+    GET /api/price-targets?tickers=AAPL,MSFT,NVDA
+    Returns mkt_cap, avg_pt, pt_pct for each ticker. Synchronous, fast.
+    Used by tabs that need PT data independently of a full scan.
+    """
+    tickers_raw = request.args.get("tickers", "")
+    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    if not tickers:
+        return jsonify({"error": "tickers param required"}), 400
+    tickers = tickers[:80]
+
+    def _fetch_pt(sym):
+        quote = _fetch_quote(sym)
+        pt    = _fetch_price_target(sym)
+        price    = quote.get("price")
+        mkt_cap  = quote.get("mkt_cap")
+        avg_pt   = pt.get("avg_pt")
+        pt_pct   = round((price / avg_pt - 1) * 100, 1) if price and avg_pt and avg_pt > 0 else None
+        return sym, {"mkt_cap": mkt_cap, "avg_pt": avg_pt, "pt_pct": pt_pct}
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        for sym, data in pool.map(lambda t: _fetch_pt(t), tickers):
+            results[sym] = data
+
+    return jsonify({"results": results})
+
+
 # ── Earnings tracker endpoint ─────────────────────────────────────────────────
 
 @app.route("/api/earnings")

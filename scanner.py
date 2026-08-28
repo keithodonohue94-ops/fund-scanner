@@ -316,21 +316,21 @@ def _fetch_price_target(symbol: str) -> dict:
 
 
 def _fetch_earnings_surprises(symbol: str, limit: int = 4) -> list:
-    """Fetch last N quarters of EPS/revenue actual vs estimate from FMP."""
+    """Fetch last N quarters of EPS/revenue actual vs estimate from FMP stable earnings endpoint."""
     data = _fmp_get(
-        f"{FMP_STABLE}/earnings-surprises",
+        f"{FMP_STABLE}/earnings",
         {"symbol": symbol.upper(), "limit": limit}
     )
     if not isinstance(data, list):
         return []
     result = []
     for row in data[:limit]:
-        actual = _safe_float(row.get("actualEarningResult"))
-        est    = _safe_float(row.get("estimatedEarning"))
+        actual = _safe_float(row.get("eps") or row.get("actualEps") or row.get("actualEarningResult"))
+        est    = _safe_float(row.get("epsEstimated") or row.get("estimatedEps") or row.get("estimatedEarning"))
         eps_surp = None
         if actual is not None and est is not None and est != 0:
             eps_surp = round((actual - est) / abs(est) * 100, 1)
-        rev_actual = _safe_float(row.get("revenueActual") or row.get("actualRevenue"))
+        rev_actual = _safe_float(row.get("revenue") or row.get("revenueActual") or row.get("actualRevenue"))
         rev_est    = _safe_float(row.get("revenueEstimated") or row.get("estimatedRevenue"))
         rev_surp   = None
         if rev_actual is not None and rev_est is not None and rev_est != 0:
