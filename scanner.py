@@ -546,7 +546,7 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
     results = []
 
     # ── Senate ────────────────────────────────────────────────────────────────
-    senate_raw = _fmp_get(f"{FMP_STABLE}/senate-trading", {"limit": limit}) or []
+    senate_raw = _fmp_get(f"{FMP_STABLE}/senate-trades", {"limit": limit}) or []
     if isinstance(senate_raw, dict):
         senate_raw = senate_raw.get("data", []) or []
     for row in senate_raw:
@@ -573,7 +573,7 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         })
 
     # ── House ─────────────────────────────────────────────────────────────────
-    house_raw = _fmp_get(f"{FMP_STABLE}/house-disclosure", {"limit": limit}) or []
+    house_raw = _fmp_get(f"{FMP_STABLE}/house-trades", {"limit": limit}) or []
     if isinstance(house_raw, dict):
         house_raw = house_raw.get("data", []) or []
     for row in house_raw:
