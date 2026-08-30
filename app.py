@@ -399,6 +399,18 @@ def backfill_political_trades():
     return jsonify({"status": "backfill_started"})
 
 
+@app.route("/api/political-trades/debug")
+def debug_political_trades():
+    """GET /api/political-trades/debug — returns raw FMP response for MU to inspect field names."""
+    from scanner import FMP_STABLE, FMP_API_KEY, _fmp_get
+    senate = _fmp_get(f"{FMP_STABLE}/senate-trades", {"symbol": "MU"}) or []
+    house  = _fmp_get(f"{FMP_STABLE}/house-trades",  {"symbol": "MU"}) or []
+    return jsonify({
+        "senate_sample": senate[:2] if isinstance(senate, list) else senate,
+        "house_sample":  house[:2]  if isinstance(house,  list) else house,
+    })
+
+
 @app.route("/api/political-trades/refresh", methods=["POST"])
 def refresh_political_trades():
     """
