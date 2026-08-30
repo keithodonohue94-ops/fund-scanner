@@ -156,7 +156,8 @@ def _background_scheduler():
         logger.info("EOD scan complete — all results saved to DB.")
         # Nightly political trades refresh — fetch latest 100 disclosures, upsert new ones
         try:
-            trades = _fetch_political_trades(tickers=None, limit=100)
+            all_tickers = {t for tickers in UNIVERSES.values() for t in tickers}
+            trades = _fetch_political_trades(tickers=all_tickers, limit=100)
             inserted = _db.upsert_political_trades(trades)
             logger.info("Political trades nightly refresh — %d fetched, %d new", len(trades), inserted)
         except Exception as _pe:
@@ -389,7 +390,8 @@ def backfill_political_trades():
     """
     def _run():
         logger.info("Political trades backfill started")
-        trades = _fetch_political_trades(tickers=None, limit=1000)
+        all_tickers = {t for tickers in UNIVERSES.values() for t in tickers}
+        trades = _fetch_political_trades(tickers=all_tickers, limit=1000)
         inserted = _db.upsert_political_trades(trades)
         logger.info("Political trades backfill done — %d fetched, %d new", len(trades), inserted)
     t = threading.Thread(target=_run, daemon=True)

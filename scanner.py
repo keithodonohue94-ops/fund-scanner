@@ -528,7 +528,8 @@ def _fetch_all(symbol: str) -> dict:
 
 def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
     """
-    Fetch recent Senate + House trading disclosures from FMP.
+    Fetch recent Senate + House trading disclosures from FMP using paginated
+    'latest' endpoints (no symbol required).
     tickers: optional set of uppercase ticker symbols to filter to.
              If None, returns all disclosures up to limit.
     Returns list of normalised dicts sorted by disc_date desc.
@@ -543,13 +544,26 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         except Exception:
             return None
 
+    def _paginate(endpoint: str, page_limit: int = 100) -> list:
+        """Fetch pages from a paginated FMP endpoint until we have enough rows."""
+        rows = []
+        page = 0
+        while len(rows) < limit:
+            batch = _fmp_get(endpoint, {"page": page, "limit": page_limit}) or []
+            if isinstance(batch, dict):
+                batch = batch.get("data", []) or []
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < page_limit:
+                break  # last page
+            page += 1
+        return rows[:limit]
+
     results = []
 
     # ── Senate ────────────────────────────────────────────────────────────────
-    senate_raw = _fmp_get(f"{FMP_STABLE}/senate-trades", {"limit": limit}) or []
-    if isinstance(senate_raw, dict):
-        senate_raw = senate_raw.get("data", []) or []
-    for row in senate_raw:
+    for row in _paginate(f"{FMP_STABLE}/senate-latest"):
         ticker = (row.get("ticker") or "").upper().strip()
         if not ticker or ticker in ("--", "N/A", ""):
             continue
@@ -559,12 +573,12 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         disc_dt   = (row.get("dateRecieved") or row.get("disclosureDate") or "")[:10]
         results.append({
             "chamber":    "Senate",
-            "name":       row.get("senator") or row.get("name") or "—",
+            "name":       row.get("senator") or row.get("firstName", "") + " " + row.get("lastName", "") or row.get("name") or "—",
             "party":      row.get("party") or "",
-            "district":   row.get("district") or "",
+            "district":   row.get("district") or row.get("state") or "",
             "ticker":     ticker,
-            "asset":      row.get("assetDescription") or "",
-            "type":       row.get("type") or "",
+            "asset":      row.get("assetDescription") or row.get("asset") or "",
+            "type":       row.get("type") or row.get("transactionType") or "",
             "amount":     row.get("amount") or "",
             "trade_date": trade_dt,
             "disc_date":  disc_dt,
@@ -573,10 +587,7 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         })
 
     # ── House ─────────────────────────────────────────────────────────────────
-    house_raw = _fmp_get(f"{FMP_STABLE}/house-trades", {"limit": limit}) or []
-    if isinstance(house_raw, dict):
-        house_raw = house_raw.get("data", []) or []
-    for row in house_raw:
+    for row in _paginate(f"{FMP_STABLE}/house-latest"):
         ticker = (row.get("ticker") or "").upper().strip()
         if not ticker or ticker in ("--", "N/A", ""):
             continue
@@ -586,12 +597,12 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         disc_dt  = (row.get("disclosureDate") or row.get("dateRecieved") or "")[:10]
         results.append({
             "chamber":    "House",
-            "name":       row.get("representative") or row.get("name") or "—",
+            "name":       row.get("representative") or row.get("firstName", "") + " " + row.get("lastName", "") or row.get("name") or "—",
             "party":      row.get("party") or "",
-            "district":   row.get("district") or "",
+            "district":   row.get("district") or row.get("state") or "",
             "ticker":     ticker,
-            "asset":      row.get("assetDescription") or "",
-            "type":       row.get("type") or "",
+            "asset":      row.get("assetDescription") or row.get("asset") or "",
+            "type":       row.get("type") or row.get("transactionType") or "",
             "amount":     row.get("amount") or "",
             "trade_date": trade_dt,
             "disc_date":  disc_dt,
