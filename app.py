@@ -402,12 +402,14 @@ def backfill_political_trades():
 @app.route("/api/political-trades/debug")
 def debug_political_trades():
     """GET /api/political-trades/debug — returns raw FMP response for MU to inspect field names."""
-    from scanner import FMP_STABLE, FMP_API_KEY, _fmp_get
-    senate = _fmp_get(f"{FMP_STABLE}/senate-trades", {"symbol": "MU"}) or []
-    house  = _fmp_get(f"{FMP_STABLE}/house-trades",  {"symbol": "MU"}) or []
+    from scanner import FMP_STABLE, _fmp_get
+    senate  = _fmp_get(f"{FMP_STABLE}/senate-trades", {"symbol": "MU"}) or []
+    house   = _fmp_get(f"{FMP_STABLE}/house-trades",  {"symbol": "MU"}) or []
+    earnings = _fmp_get(f"{FMP_STABLE}/earnings",     {"symbol": "MU", "limit": 2}) or []
     return jsonify({
-        "senate_sample": senate[:2] if isinstance(senate, list) else senate,
-        "house_sample":  house[:2]  if isinstance(house,  list) else house,
+        "senate_sample":   senate[:2]   if isinstance(senate,   list) else senate,
+        "house_sample":    house[:2]    if isinstance(house,    list) else house,
+        "earnings_sample": earnings[:2] if isinstance(earnings, list) else earnings,
     })
 
 
