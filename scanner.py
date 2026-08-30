@@ -343,7 +343,7 @@ def _fetch_earnings_surprises(symbol: str, limit: int = 8) -> list:
         date_str = row.get("date", "")
         is_upcoming = bool(date_str) and date_str > today_str
 
-        actual = _pick(row, "eps", "actualEps", "actualEarningResult")
+        actual = _pick(row, "epsActual", "eps", "actualEps", "actualEarningResult")
         est    = _pick(row, "epsEstimated", "estimatedEps", "estimatedEarning")
         eps_surp = None
         if actual is not None and est is not None and est != 0:
@@ -557,15 +557,15 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         for row in senate_raw:
             trade_dt = (row.get("transactionDate") or "")[:10]
             disc_dt  = (row.get("dateRecieved") or row.get("disclosureDate") or "")[:10]
-            key = ("Senate", row.get("senator") or "", ticker, trade_dt, row.get("type") or "")
+            key = ("Senate", row.get("office") or (row.get("firstName","")+" "+row.get("lastName","")).strip() or "", ticker, trade_dt, row.get("type") or "")
             if key in seen:
                 continue
             seen.add(key)
             results.append({
                 "chamber":    "Senate",
-                "name":       row.get("senator") or row.get("name") or "—",
+                "name":       row.get("office") or (row.get("firstName","")+" "+row.get("lastName","")).strip() or "—",
                 "party":      row.get("party") or "",
-                "district":   row.get("district") or row.get("state") or "",
+                "district":   row.get("district") or "",
                 "ticker":     ticker,
                 "asset":      row.get("assetDescription") or row.get("asset") or "",
                 "type":       row.get("type") or "",
@@ -583,13 +583,13 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         for row in house_raw:
             trade_dt = (row.get("transactionDate") or "")[:10]
             disc_dt  = (row.get("disclosureDate") or row.get("dateRecieved") or "")[:10]
-            key = ("House", row.get("representative") or row.get("name") or "", ticker, trade_dt, row.get("type") or "")
+            key = ("House", row.get("office") or (row.get("firstName","")+" "+row.get("lastName","")).strip() or "", ticker, trade_dt, row.get("type") or "")
             if key in seen:
                 continue
             seen.add(key)
             results.append({
                 "chamber":    "House",
-                "name":       row.get("representative") or row.get("name") or "—",
+                "name":       row.get("office") or (row.get("firstName","")+" "+row.get("lastName","")).strip() or "—",
                 "party":      row.get("party") or "",
                 "district":   row.get("district") or row.get("state") or "",
                 "ticker":     ticker,
