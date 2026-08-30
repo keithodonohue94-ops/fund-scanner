@@ -53,7 +53,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -397,6 +397,21 @@ def backfill_political_trades():
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return jsonify({"status": "backfill_started"})
+
+
+@app.route("/api/political-trades/clear")
+def clear_political_trades():
+    """POST /api/political-trades/clear — delete all rows from political_trades table."""
+    try:
+        session = _db._Session()
+        deleted = session.query(_db.PoliticalTrade).filter(
+            (_db.PoliticalTrade.name == "—") | (_db.PoliticalTrade.name == "") | (_db.PoliticalTrade.name == None)
+        ).delete()
+        session.commit()
+        session.close()
+        return jsonify({"status": "ok", "deleted": deleted})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/political-trades/debug")
