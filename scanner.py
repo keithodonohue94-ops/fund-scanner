@@ -528,13 +528,12 @@ def _fetch_all(symbol: str) -> dict:
 
 def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
     """
-    Fetch recent Senate + House trading disclosures from FMP using paginated
-    'latest' endpoints (no symbol required).
-    tickers: optional set of uppercase ticker symbols to filter to.
-             If None, returns all disclosures up to limit.
+    Fetch Senate + House trading disclosures from FMP per-symbol endpoints.
+    tickers: set of uppercase ticker symbols to fetch. If None, returns empty.
     Returns list of normalised dicts sorted by disc_date desc.
     """
     from datetime import datetime as _dt
+    import time as _time
 
     def _lag(trade_date: str, disc_date: str):
         try:
@@ -544,74 +543,69 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         except Exception:
             return None
 
-    def _paginate(endpoint: str, page_limit: int = 100) -> list:
-        """Fetch pages from a paginated FMP endpoint until we have enough rows."""
-        rows = []
-        page = 0
-        while len(rows) < limit:
-            batch = _fmp_get(endpoint, {"page": page, "limit": page_limit}) or []
-            if isinstance(batch, dict):
-                batch = batch.get("data", []) or []
-            if not batch:
-                break
-            rows.extend(batch)
-            if len(batch) < page_limit:
-                break  # last page
-            page += 1
-        return rows[:limit]
+    if not tickers:
+        return []
 
+    seen = set()
     results = []
 
-    # ── Senate ────────────────────────────────────────────────────────────────
-    for row in _paginate(f"{FMP_STABLE}/senate-latest"):
-        ticker = (row.get("ticker") or "").upper().strip()
-        if not ticker or ticker in ("--", "N/A", ""):
-            continue
-        if tickers and ticker not in tickers:
-            continue
-        trade_dt  = (row.get("transactionDate") or "")[:10]
-        disc_dt   = (row.get("dateRecieved") or row.get("disclosureDate") or "")[:10]
-        results.append({
-            "chamber":    "Senate",
-            "name":       row.get("senator") or row.get("firstName", "") + " " + row.get("lastName", "") or row.get("name") or "—",
-            "party":      row.get("party") or "",
-            "district":   row.get("district") or row.get("state") or "",
-            "ticker":     ticker,
-            "asset":      row.get("assetDescription") or row.get("asset") or "",
-            "type":       row.get("type") or row.get("transactionType") or "",
-            "amount":     row.get("amount") or "",
-            "trade_date": trade_dt,
-            "disc_date":  disc_dt,
-            "lag_days":   _lag(trade_dt, disc_dt),
-            "link":       row.get("link") or "",
-        })
+    for ticker in sorted(tickers):
+        # Senate trades for this ticker
+        senate_raw = _fmp_get(f"{FMP_STABLE}/senate-trades", {"symbol": ticker}) or []
+        if isinstance(senate_raw, dict):
+            senate_raw = senate_raw.get("data", []) or []
+        for row in senate_raw:
+            trade_dt = (row.get("transactionDate") or "")[:10]
+            disc_dt  = (row.get("dateRecieved") or row.get("disclosureDate") or "")[:10]
+            key = ("Senate", row.get("senator") or "", ticker, trade_dt, row.get("type") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "chamber":    "Senate",
+                "name":       row.get("senator") or row.get("name") or "—",
+                "party":      row.get("party") or "",
+                "district":   row.get("district") or row.get("state") or "",
+                "ticker":     ticker,
+                "asset":      row.get("assetDescription") or row.get("asset") or "",
+                "type":       row.get("type") or "",
+                "amount":     row.get("amount") or "",
+                "trade_date": trade_dt,
+                "disc_date":  disc_dt,
+                "lag_days":   _lag(trade_dt, disc_dt),
+                "link":       row.get("link") or "",
+            })
 
-    # ── House ─────────────────────────────────────────────────────────────────
-    for row in _paginate(f"{FMP_STABLE}/house-latest"):
-        ticker = (row.get("ticker") or "").upper().strip()
-        if not ticker or ticker in ("--", "N/A", ""):
-            continue
-        if tickers and ticker not in tickers:
-            continue
-        trade_dt = (row.get("transactionDate") or "")[:10]
-        disc_dt  = (row.get("disclosureDate") or row.get("dateRecieved") or "")[:10]
-        results.append({
-            "chamber":    "House",
-            "name":       row.get("representative") or row.get("firstName", "") + " " + row.get("lastName", "") or row.get("name") or "—",
-            "party":      row.get("party") or "",
-            "district":   row.get("district") or row.get("state") or "",
-            "ticker":     ticker,
-            "asset":      row.get("assetDescription") or row.get("asset") or "",
-            "type":       row.get("type") or row.get("transactionType") or "",
-            "amount":     row.get("amount") or "",
-            "trade_date": trade_dt,
-            "disc_date":  disc_dt,
-            "lag_days":   _lag(trade_dt, disc_dt),
-            "link":       row.get("link") or "",
-        })
+        # House trades for this ticker
+        house_raw = _fmp_get(f"{FMP_STABLE}/house-trades", {"symbol": ticker}) or []
+        if isinstance(house_raw, dict):
+            house_raw = house_raw.get("data", []) or []
+        for row in house_raw:
+            trade_dt = (row.get("transactionDate") or "")[:10]
+            disc_dt  = (row.get("disclosureDate") or row.get("dateRecieved") or "")[:10]
+            key = ("House", row.get("representative") or row.get("name") or "", ticker, trade_dt, row.get("type") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "chamber":    "House",
+                "name":       row.get("representative") or row.get("name") or "—",
+                "party":      row.get("party") or "",
+                "district":   row.get("district") or row.get("state") or "",
+                "ticker":     ticker,
+                "asset":      row.get("assetDescription") or row.get("asset") or "",
+                "type":       row.get("type") or "",
+                "amount":     row.get("amount") or "",
+                "trade_date": trade_dt,
+                "disc_date":  disc_dt,
+                "lag_days":   _lag(trade_dt, disc_dt),
+                "link":       row.get("link") or "",
+            })
+
+        _time.sleep(0.15)  # stay within FMP rate limits
 
     results.sort(key=lambda x: x.get("disc_date") or "", reverse=True)
-    return results
+    return results[:limit]
 
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
