@@ -82,6 +82,35 @@ class FundamentalsSnapshot(Base):
     )
 
 
+# ── Political trades model ────────────────────────────────────────────────────
+
+class PoliticalTrade(Base):
+    __tablename__ = "political_trades"
+
+    id          = Column(Integer, primary_key=True)
+    chamber     = Column(String(10),  nullable=False)   # "Senate" | "House"
+    name        = Column(String(200), nullable=False)
+    party       = Column(String(20))
+    district    = Column(String(100))
+    ticker      = Column(String(20),  nullable=False)
+    asset       = Column(String(500))
+    type        = Column(String(100))                   # "Purchase", "Sale (Full)", …
+    amount      = Column(String(100))                   # "$1,001 - $15,000"
+    trade_date  = Column(String(10))                    # YYYY-MM-DD
+    disc_date   = Column(String(10))                    # YYYY-MM-DD (disclosed / filed)
+    lag_days    = Column(Integer)
+    link        = Column(String(500))
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        # Deduplicate on the natural key — same politician, same ticker, same trade date, same type
+        UniqueConstraint("chamber", "name", "ticker", "trade_date", "type", name="uq_pol_trade"),
+        Index("ix_pol_ticker",    "ticker"),
+        Index("ix_pol_disc_date", "disc_date"),
+        Index("ix_pol_name",      "name"),
+    )
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def init_db():
@@ -214,6 +243,91 @@ def get_ticker_list(universe: str | None = None) -> list:
         return sorted(r[0] for r in q.all())
     finally:
         session.close()
+
+
+# ── Political trades DB functions ────────────────────────────────────────────
+
+def upsert_political_trades(trades: list) -> int:
+    """
+    Insert political trade records, ignoring duplicates (ON CONFLICT DO NOTHING).
+    Returns number of new rows inserted.
+    """
+    if not trades:
+        return 0
+    session = _Session()
+    inserted = 0
+    try:
+        for t in trades:
+            existing = session.query(PoliticalTrade).filter_by(
+                chamber=t.get("chamber", ""),
+                name=t.get("name", ""),
+                ticker=t.get("ticker", ""),
+                trade_date=t.get("trade_date", ""),
+                type=t.get("type", ""),
+            ).first()
+            if existing:
+                continue
+            row = PoliticalTrade(
+                chamber    = t.get("chamber", ""),
+                name       = t.get("name", ""),
+                party      = t.get("party", ""),
+                district   = t.get("district", ""),
+                ticker     = t.get("ticker", ""),
+                asset      = t.get("asset", ""),
+                type       = t.get("type", ""),
+                amount     = t.get("amount", ""),
+                trade_date = t.get("trade_date", ""),
+                disc_date  = t.get("disc_date", ""),
+                lag_days   = t.get("lag_days"),
+                link       = t.get("link", ""),
+            )
+            session.add(row)
+            inserted += 1
+        session.commit()
+        return inserted
+    except Exception as exc:
+        session.rollback()
+        logger.error("upsert_political_trades error: %s", exc)
+        raise
+    finally:
+        session.close()
+
+
+def get_political_trades(tickers: set = None, since_date: str = None, limit: int = 2000) -> list:
+    """
+    Query stored political trades.
+    tickers:    optional set of uppercase ticker symbols to filter
+    since_date: optional YYYY-MM-DD — only return rows with disc_date >= this
+    limit:      max rows returned (newest disc_date first)
+    """
+    session = _Session()
+    try:
+        q = session.query(PoliticalTrade).order_by(PoliticalTrade.disc_date.desc())
+        if tickers:
+            q = q.filter(PoliticalTrade.ticker.in_(tickers))
+        if since_date:
+            q = q.filter(PoliticalTrade.disc_date >= since_date)
+        rows = q.limit(limit).all()
+        return [_pol_row_to_dict(r) for r in rows]
+    finally:
+        session.close()
+
+
+def _pol_row_to_dict(r: PoliticalTrade) -> dict:
+    return {
+        "chamber":    r.chamber,
+        "name":       r.name,
+        "party":      r.party,
+        "district":   r.district,
+        "ticker":     r.ticker,
+        "asset":      r.asset,
+        "type":       r.type,
+        "amount":     r.amount,
+        "trade_date": r.trade_date,
+        "disc_date":  r.disc_date,
+        "lag_days":   r.lag_days,
+        "link":       r.link,
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

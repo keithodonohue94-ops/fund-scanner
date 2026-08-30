@@ -154,6 +154,13 @@ def _background_scheduler():
             _run_scan(ukey, save_to_db=True)
             time.sleep(15)   # 15s between universes to avoid FMP rate limits
         logger.info("EOD scan complete — all results saved to DB.")
+        # Nightly political trades refresh — fetch latest 100 disclosures, upsert new ones
+        try:
+            trades = _fetch_political_trades(tickers=None, limit=100)
+            inserted = _db.upsert_political_trades(trades)
+            logger.info("Political trades nightly refresh — %d fetched, %d new", len(trades), inserted)
+        except Exception as _pe:
+            logger.error("Political trades nightly refresh error: %s", _pe)
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
@@ -354,24 +361,55 @@ def get_earnings():
     return jsonify({"results": results, "count": len(results)})
 
 
-# ── Political trades endpoint ─────────────────────────────────────────────────
+# ── Political trades endpoints ────────────────────────────────────────────────
 
 @app.route("/api/political-trades")
 def get_political_trades():
     """
-    GET /api/political-trades?tickers=AAPL,MSFT&limit=500
-    Returns Senate + House trading disclosures from FMP.
-    If tickers param provided, filters to those symbols only.
-    Omit tickers to return all disclosures.
+    GET /api/political-trades?tickers=AAPL,MSFT&limit=2000
+    Serves from DB. Optionally filters to ticker list.
     """
     tickers_raw = request.args.get("tickers", "")
     tickers = set(t.strip().upper() for t in tickers_raw.split(",") if t.strip()) if tickers_raw else None
-    limit = min(int(request.args.get("limit", 500)), 1000)
+    limit = min(int(request.args.get("limit", 2000)), 5000)
     try:
-        data = _fetch_political_trades(tickers=tickers, limit=limit)
+        data = _db.get_political_trades(tickers=tickers, limit=limit)
         return jsonify({"results": data, "count": len(data)})
     except Exception as exc:
         logger.error("political-trades error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/political-trades/backfill", methods=["POST"])
+def backfill_political_trades():
+    """
+    POST /api/political-trades/backfill
+    One-time: fetches up to 1000 records from FMP senate-trading + house-disclosure,
+    upserts all into political_trades table.
+    """
+    def _run():
+        logger.info("Political trades backfill started")
+        trades = _fetch_political_trades(tickers=None, limit=1000)
+        inserted = _db.upsert_political_trades(trades)
+        logger.info("Political trades backfill done — %d fetched, %d new", len(trades), inserted)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"status": "backfill_started"})
+
+
+@app.route("/api/political-trades/refresh", methods=["POST"])
+def refresh_political_trades():
+    """
+    POST /api/political-trades/refresh
+    Nightly: fetches the 100 most recent records from FMP,
+    upserts only new ones (dedup by unique constraint).
+    """
+    try:
+        trades = _fetch_political_trades(tickers=None, limit=100)
+        inserted = _db.upsert_political_trades(trades)
+        return jsonify({"status": "ok", "fetched": len(trades), "inserted": inserted})
+    except Exception as exc:
+        logger.error("political-trades refresh error: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
 
