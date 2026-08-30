@@ -524,6 +524,85 @@ def _fetch_all(symbol: str) -> dict:
     }
 
 
+# ── Political trades ──────────────────────────────────────────────────────────
+
+def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
+    """
+    Fetch recent Senate + House trading disclosures from FMP.
+    tickers: optional set of uppercase ticker symbols to filter to.
+             If None, returns all disclosures up to limit.
+    Returns list of normalised dicts sorted by disc_date desc.
+    """
+    from datetime import datetime as _dt
+
+    def _lag(trade_date: str, disc_date: str):
+        try:
+            td = _dt.strptime(trade_date[:10], "%Y-%m-%d")
+            dd = _dt.strptime(disc_date[:10], "%Y-%m-%d")
+            return (dd - td).days
+        except Exception:
+            return None
+
+    results = []
+
+    # ── Senate ────────────────────────────────────────────────────────────────
+    senate_raw = _fmp_get(f"{FMP_STABLE}/senate-trading", {"limit": limit}) or []
+    if isinstance(senate_raw, dict):
+        senate_raw = senate_raw.get("data", []) or []
+    for row in senate_raw:
+        ticker = (row.get("ticker") or "").upper().strip()
+        if not ticker or ticker in ("--", "N/A", ""):
+            continue
+        if tickers and ticker not in tickers:
+            continue
+        trade_dt  = (row.get("transactionDate") or "")[:10]
+        disc_dt   = (row.get("dateRecieved") or row.get("disclosureDate") or "")[:10]
+        results.append({
+            "chamber":    "Senate",
+            "name":       row.get("senator") or row.get("name") or "—",
+            "party":      row.get("party") or "",
+            "district":   row.get("district") or "",
+            "ticker":     ticker,
+            "asset":      row.get("assetDescription") or "",
+            "type":       row.get("type") or "",
+            "amount":     row.get("amount") or "",
+            "trade_date": trade_dt,
+            "disc_date":  disc_dt,
+            "lag_days":   _lag(trade_dt, disc_dt),
+            "link":       row.get("link") or "",
+        })
+
+    # ── House ─────────────────────────────────────────────────────────────────
+    house_raw = _fmp_get(f"{FMP_STABLE}/house-disclosure", {"limit": limit}) or []
+    if isinstance(house_raw, dict):
+        house_raw = house_raw.get("data", []) or []
+    for row in house_raw:
+        ticker = (row.get("ticker") or "").upper().strip()
+        if not ticker or ticker in ("--", "N/A", ""):
+            continue
+        if tickers and ticker not in tickers:
+            continue
+        trade_dt = (row.get("transactionDate") or "")[:10]
+        disc_dt  = (row.get("disclosureDate") or row.get("dateRecieved") or "")[:10]
+        results.append({
+            "chamber":    "House",
+            "name":       row.get("representative") or row.get("name") or "—",
+            "party":      row.get("party") or "",
+            "district":   row.get("district") or "",
+            "ticker":     ticker,
+            "asset":      row.get("assetDescription") or "",
+            "type":       row.get("type") or "",
+            "amount":     row.get("amount") or "",
+            "trade_date": trade_dt,
+            "disc_date":  disc_dt,
+            "lag_days":   _lag(trade_dt, disc_dt),
+            "link":       row.get("link") or "",
+        })
+
+    results.sort(key=lambda x: x.get("disc_date") or "", reverse=True)
+    return results
+
+
 # ── Main scan ─────────────────────────────────────────────────────────────────
 
 def scan_tickers(tickers: list, delay: float = 0) -> list:

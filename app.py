@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from scanner import scan_tickers, UNIVERSES, _fetch_earnings_surprises, _fetch_quote, _fetch_price_target, _fetch_ratios
+from scanner import scan_tickers, UNIVERSES, _fetch_earnings_surprises, _fetch_quote, _fetch_price_target, _fetch_ratios, _fetch_political_trades
 import db as _db
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -352,6 +352,27 @@ def get_earnings():
                 results[ticker] = []
 
     return jsonify({"results": results, "count": len(results)})
+
+
+# ── Political trades endpoint ─────────────────────────────────────────────────
+
+@app.route("/api/political-trades")
+def get_political_trades():
+    """
+    GET /api/political-trades?tickers=AAPL,MSFT&limit=500
+    Returns Senate + House trading disclosures from FMP.
+    If tickers param provided, filters to those symbols only.
+    Omit tickers to return all disclosures.
+    """
+    tickers_raw = request.args.get("tickers", "")
+    tickers = set(t.strip().upper() for t in tickers_raw.split(",") if t.strip()) if tickers_raw else None
+    limit = min(int(request.args.get("limit", 500)), 1000)
+    try:
+        data = _fetch_political_trades(tickers=tickers, limit=limit)
+        return jsonify({"results": data, "count": len(data)})
+    except Exception as exc:
+        logger.error("political-trades error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
 
 
 # ── History endpoints ─────────────────────────────────────────────────────────
