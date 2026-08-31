@@ -271,7 +271,18 @@ def _compute_peg(fwd_pe: float, ntm_eps: float, beyond_ntm: list, symbol: str = 
 
     n = len(beyond_ntm) // 4
     if n < 2:
-        logger.info("[peg] %s — only %d complete years beyond NTM, need ≥2", symbol, n)
+        logger.info("[peg] %s — only %d complete years beyond NTM, trying implied-growth fallback", symbol, n)
+        # Fallback: use NTM EPS as current year, sum of first 4 beyond_ntm quarters as next year
+        if len(beyond_ntm) >= 4 and fwd_pe and ntm_eps > 0:
+            next_yr_values = [_safe_float(r.get("epsAvg")) for r in beyond_ntm[:4]]
+            if any(v is not None for v in next_yr_values):
+                next_yr_eps = sum(v for v in next_yr_values if v is not None)
+                if next_yr_eps > 0 and next_yr_eps > ntm_eps:
+                    growth_pct = (next_yr_eps / ntm_eps - 1) * 100
+                    peg = round(fwd_pe / growth_pct, 2)
+                    logger.info("[peg] %s implied-growth fallback: ntm=%.4f next_yr=%.4f growth=%.1f%% fwd_pe=%.1f peg=%.2f",
+                                symbol, ntm_eps, next_yr_eps, growth_pct, fwd_pe, peg)
+                    return (peg, "implied") if peg > 0 else None
         return None
 
     usable = beyond_ntm[:n * 4]
@@ -297,7 +308,7 @@ def _compute_peg(fwd_pe: float, ntm_eps: float, beyond_ntm: list, symbol: str = 
     if cagr_pct <= 0:
         return None
 
-    return round(fwd_pe / cagr_pct, 2)
+    return round(fwd_pe / cagr_pct, 2), "cagr2y"
 
 
 def _fetch_price_target(symbol: str) -> dict:
@@ -498,7 +509,17 @@ def _fetch_all(symbol: str) -> dict:
     fwd_pe = round(price / fwd_eps, 1) if price and fwd_eps and fwd_eps > 0 else None
 
     # PEG: forward PE / n-year CAGR from NTM EPS base to terminal (quarter-based)
-    peg = _compute_peg(fwd_pe, fwd_eps, beyond_ntm, symbol=symbol)
+    # Fall back to FMP's own pegRatio when we lack enough forward quarters
+    peg_result = _compute_peg(fwd_pe, fwd_eps, beyond_ntm, symbol=symbol)
+    if peg_result is not None:
+        peg, peg_method = peg_result
+    else:
+        peg, peg_method = None, None
+    if peg is None:
+        # Last resort: FMP's own pegRatio (stale price but better than blank)
+        peg_fmp = ratios.get("peg_fmp")
+        if peg_fmp and peg_fmp > 0:
+            peg, peg_method = round(peg_fmp, 2), "fmp"
 
     ps = round(mkt_cap / ttm_rev, 2) if mkt_cap and ttm_rev and ttm_rev > 0 else None
 
@@ -514,6 +535,7 @@ def _fetch_all(symbol: str) -> dict:
         "pe":             pe_ttm,
         "fwd_pe":         fwd_pe,
         "peg":            peg,
+        "peg_method":     peg_method,
         "ps":             ps,
         "debt_to_equity": round(debt_to_equity, 2) if debt_to_equity is not None else None,
         "rev_growth":     income.get("rev_growth"),
