@@ -15,7 +15,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     create_engine, Column, Float, String, Date, DateTime,
-    Integer, UniqueConstraint, Index, text
+    Integer, Boolean, UniqueConstraint, Index, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -38,7 +38,7 @@ _Session = sessionmaker(bind=_engine)
 Base = declarative_base()
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class FundamentalsSnapshot(Base):
     __tablename__ = "fundamentals_snapshot"
@@ -82,8 +82,6 @@ class FundamentalsSnapshot(Base):
     )
 
 
-# ── Political trades model ────────────────────────────────────────────────────
-
 class PoliticalTrade(Base):
     __tablename__ = "political_trades"
 
@@ -103,11 +101,54 @@ class PoliticalTrade(Base):
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
-        # Deduplicate on the natural key — same politician, same ticker, same trade date, same type
         UniqueConstraint("chamber", "name", "ticker", "trade_date", "type", name="uq_pol_trade"),
         Index("ix_pol_ticker",    "ticker"),
         Index("ix_pol_disc_date", "disc_date"),
         Index("ix_pol_name",      "name"),
+    )
+
+
+class EarningsSurprise(Base):
+    """One row per company per fiscal quarter — never overwritten once actuals exist."""
+    __tablename__ = "earnings_surprises"
+
+    id             = Column(Integer, primary_key=True)
+    ticker         = Column(String(20), nullable=False)
+    fiscal_end     = Column(String(10), nullable=False)  # YYYY-MM-DD fiscal quarter end
+    announced_date = Column(String(10))                   # YYYY-MM-DD actual report date
+    is_upcoming    = Column(Boolean, default=False)        # True until company reports
+
+    eps_actual     = Column(Float)
+    eps_est        = Column(Float)
+    eps_surp       = Column(Float)   # % beat/miss
+
+    rev_actual     = Column(Float)
+    rev_est        = Column(Float)
+    rev_surp       = Column(Float)   # % beat/miss
+
+    fetched_at     = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("ticker", "fiscal_end", name="uq_earnings"),
+        Index("ix_earn_ticker",     "ticker"),
+        Index("ix_earn_fiscal_end", "fiscal_end"),
+        Index("ix_earn_upcoming",   "is_upcoming"),
+    )
+
+
+class ReportCalendar(Base):
+    """Upcoming earnings report dates fetched from FMP earnings calendar."""
+    __tablename__ = "report_calendar"
+
+    id          = Column(Integer, primary_key=True)
+    ticker      = Column(String(20), nullable=False)
+    report_date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    fetched_at  = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("ticker", "report_date", name="uq_cal"),
+        Index("ix_cal_report_date", "report_date"),
+        Index("ix_cal_ticker",      "ticker"),
     )
 
 
@@ -118,6 +159,8 @@ def init_db():
     Base.metadata.create_all(_engine)
     logger.info("DB ready: %s", _DATABASE_URL.split("@")[-1])  # hide credentials
 
+
+# ── Fundamentals snapshot functions ──────────────────────────────────────────
 
 def save_snapshot(universe: str, results: list):
     """
@@ -183,10 +226,7 @@ def save_snapshot(universe: str, results: list):
 
 
 def get_ticker_history(ticker: str, universe: str | None = None, days: int = 90) -> list:
-    """
-    Return daily snapshots for a single ticker, newest-first limited to `days`.
-    Optionally filter to a specific universe.
-    """
+    """Return daily snapshots for a single ticker, newest-first limited to `days`."""
     session = _Session()
     try:
         q = session.query(FundamentalsSnapshot).filter(
@@ -201,9 +241,7 @@ def get_ticker_history(ticker: str, universe: str | None = None, days: int = 90)
 
 
 def get_universe_history(universe: str, days: int = 90) -> list:
-    """
-    Return daily aggregate (average) metrics for a universe over `days` trading days.
-    """
+    """Return daily aggregate (average) metrics for a universe over `days` trading days."""
     session = _Session()
     try:
         rows = (
@@ -245,13 +283,10 @@ def get_ticker_list(universe: str | None = None) -> list:
         session.close()
 
 
-# ── Political trades DB functions ────────────────────────────────────────────
+# ── Political trades functions ────────────────────────────────────────────────
 
 def upsert_political_trades(trades: list) -> int:
-    """
-    Insert political trade records, ignoring duplicates (ON CONFLICT DO NOTHING).
-    Returns number of new rows inserted.
-    """
+    """Insert political trade records, ignoring duplicates. Returns new rows inserted."""
     if not trades:
         return 0
     session = _Session()
@@ -294,12 +329,7 @@ def upsert_political_trades(trades: list) -> int:
 
 
 def get_political_trades(tickers: set = None, since_date: str = None, limit: int = 2000) -> list:
-    """
-    Query stored political trades.
-    tickers:    optional set of uppercase ticker symbols to filter
-    since_date: optional YYYY-MM-DD — only return rows with disc_date >= this
-    limit:      max rows returned (newest disc_date first)
-    """
+    """Query stored political trades, newest disc_date first."""
     session = _Session()
     try:
         q = session.query(PoliticalTrade).order_by(PoliticalTrade.disc_date.desc())
@@ -312,6 +342,188 @@ def get_political_trades(tickers: set = None, since_date: str = None, limit: int
     finally:
         session.close()
 
+
+# ── Earnings surprise functions ───────────────────────────────────────────────
+
+def upsert_earnings(ticker: str, rows: list) -> int:
+    """
+    Upsert earnings surprise rows for a ticker.
+    - New rows are inserted.
+    - Existing upcoming rows are updated when actuals arrive (eps_surp fills in).
+    - Existing confirmed actuals are never overwritten.
+    Returns number of new rows inserted.
+    """
+    if not rows:
+        return 0
+    session = _Session()
+    inserted = updated = 0
+    try:
+        for row in rows:
+            fiscal_end = (row.get("fiscal_end") or "")[:10]
+            if not fiscal_end:
+                continue
+
+            is_upcoming = bool(row.get("is_upcoming"))
+            existing = session.query(EarningsSurprise).filter_by(
+                ticker=ticker.upper(),
+                fiscal_end=fiscal_end,
+            ).first()
+
+            if existing:
+                # Only update if: row was previously upcoming and now has actuals
+                if existing.is_upcoming and not is_upcoming:
+                    existing.announced_date = (row.get("date") or "")[:10]
+                    existing.is_upcoming    = False
+                    existing.eps_actual     = row.get("eps_actual")
+                    existing.eps_est        = row.get("eps_est")
+                    existing.eps_surp       = row.get("eps_surp")
+                    existing.rev_actual     = row.get("rev_actual")
+                    existing.rev_est        = row.get("rev_est")
+                    existing.rev_surp       = row.get("rev_surp")
+                    existing.fetched_at     = datetime.utcnow()
+                    updated += 1
+                # Confirmed actuals are left untouched
+            else:
+                session.add(EarningsSurprise(
+                    ticker         = ticker.upper(),
+                    fiscal_end     = fiscal_end,
+                    announced_date = (row.get("date") or "")[:10],
+                    is_upcoming    = is_upcoming,
+                    eps_actual     = row.get("eps_actual"),
+                    eps_est        = row.get("eps_est"),
+                    eps_surp       = row.get("eps_surp"),
+                    rev_actual     = row.get("rev_actual"),
+                    rev_est        = row.get("rev_est"),
+                    rev_surp       = row.get("rev_surp"),
+                ))
+                inserted += 1
+
+        session.commit()
+        logger.info("upsert_earnings %s: %d inserted, %d upcoming→actual", ticker, inserted, updated)
+        return inserted
+    except Exception as exc:
+        session.rollback()
+        logger.error("upsert_earnings error %s: %s", ticker, exc)
+        raise
+    finally:
+        session.close()
+
+
+def get_earnings_db(tickers: list) -> dict:
+    """
+    Return earnings surprise rows from DB keyed by ticker.
+    Result format matches _fetch_earnings_surprises output.
+    """
+    if not tickers:
+        return {}
+    session = _Session()
+    try:
+        rows = (
+            session.query(EarningsSurprise)
+            .filter(EarningsSurprise.ticker.in_([t.upper() for t in tickers]))
+            .order_by(EarningsSurprise.ticker, EarningsSurprise.fiscal_end.desc())
+            .all()
+        )
+        result: dict = {}
+        for r in rows:
+            if r.ticker not in result:
+                result[r.ticker] = []
+            result[r.ticker].append({
+                "date":        r.announced_date,
+                "fiscal_end":  r.fiscal_end,
+                "is_upcoming": r.is_upcoming,
+                "eps_actual":  r.eps_actual,
+                "eps_est":     r.eps_est,
+                "eps_surp":    r.eps_surp,
+                "rev_actual":  r.rev_actual,
+                "rev_est":     r.rev_est,
+                "rev_surp":    r.rev_surp,
+            })
+        return result
+    finally:
+        session.close()
+
+
+def count_earnings() -> int:
+    """Return total rows in earnings_surprises table (used for startup backfill check)."""
+    session = _Session()
+    try:
+        return session.query(EarningsSurprise).count()
+    finally:
+        session.close()
+
+
+def get_stale_upcoming_tickers() -> list:
+    """
+    Return tickers that have upcoming rows whose fiscal_end has already passed by 14+ days.
+    These companies should have reported by now — re-fetch to pick up actuals.
+    """
+    cutoff = datetime.utcnow().strftime("%Y-%m-%d")
+    # fiscal_end < today - 14 days means the quarter closed 2+ weeks ago
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(days=14)).strftime("%Y-%m-%d")
+    session = _Session()
+    try:
+        rows = (
+            session.query(EarningsSurprise.ticker)
+            .filter(
+                EarningsSurprise.is_upcoming == True,
+                EarningsSurprise.fiscal_end < cutoff,
+            )
+            .distinct()
+            .all()
+        )
+        return [r[0] for r in rows]
+    finally:
+        session.close()
+
+
+# ── Report calendar functions ─────────────────────────────────────────────────
+
+def upsert_calendar(entries: list) -> int:
+    """
+    Upsert upcoming report dates. Returns number of new rows inserted.
+    entries: list of {ticker, report_date} dicts.
+    """
+    if not entries:
+        return 0
+    session = _Session()
+    inserted = 0
+    try:
+        for e in entries:
+            ticker      = (e.get("ticker") or "").upper()
+            report_date = (e.get("report_date") or "")[:10]
+            if not ticker or not report_date:
+                continue
+            existing = session.query(ReportCalendar).filter_by(
+                ticker=ticker, report_date=report_date
+            ).first()
+            if not existing:
+                session.add(ReportCalendar(ticker=ticker, report_date=report_date))
+                inserted += 1
+        session.commit()
+        logger.info("upsert_calendar: %d new entries", inserted)
+        return inserted
+    except Exception as exc:
+        session.rollback()
+        logger.error("upsert_calendar error: %s", exc)
+        raise
+    finally:
+        session.close()
+
+
+def get_todays_reporters() -> set:
+    """Return set of tickers scheduled to report today."""
+    today = date.today().strftime("%Y-%m-%d")
+    session = _Session()
+    try:
+        rows = session.query(ReportCalendar).filter_by(report_date=today).all()
+        return {r.ticker for r in rows}
+    finally:
+        session.close()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _pol_row_to_dict(r: PoliticalTrade) -> dict:
     return {
@@ -329,8 +541,6 @@ def _pol_row_to_dict(r: PoliticalTrade) -> dict:
         "link":       r.link,
     }
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _row_to_dict(r: FundamentalsSnapshot) -> dict:
     return {

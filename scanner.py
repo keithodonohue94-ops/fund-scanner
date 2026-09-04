@@ -630,6 +630,31 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
     return results[:limit]
 
 
+# ── Earnings calendar ────────────────────────────────────────────────────────
+
+def _fetch_earnings_calendar(from_date: str, to_date: str) -> list:
+    """
+    Fetch upcoming earnings report dates from FMP earnings-calendar endpoint.
+    from_date / to_date: YYYY-MM-DD strings defining the window to fetch.
+    Returns list of {ticker, report_date} dicts.
+    """
+    data = _fmp_get(
+        f"{FMP_STABLE}/earnings-calendar",
+        {"from": from_date, "to": to_date},
+    )
+    if not isinstance(data, list):
+        logger.warning("earnings-calendar returned unexpected type: %s", type(data))
+        return []
+    result = []
+    for row in data:
+        ticker      = (row.get("symbol") or "").strip().upper()
+        report_date = (row.get("date") or "")[:10]
+        if ticker and report_date:
+            result.append({"ticker": ticker, "report_date": report_date})
+    logger.info("earnings-calendar: %d entries fetched (%s → %s)", len(result), from_date, to_date)
+    return result
+
+
 # ── Main scan ─────────────────────────────────────────────────────────────────
 
 def scan_tickers(tickers: list, delay: float = 0) -> list:
