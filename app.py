@@ -23,12 +23,30 @@ from datetime import datetime, timezone, timedelta, date
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+import scanner as _scanner
 from scanner import (
-    scan_tickers, UNIVERSES,
+    scan_tickers, _load_universes_from_db,
     _fetch_earnings_surprises, _fetch_earnings_calendar,
     _fetch_quote, _fetch_price_target, _fetch_ratios, _fetch_political_trades,
 )
+
+def _get_universes():
+    """Always fetch latest universe definitions from the shared DB."""
+    _scanner.UNIVERSES = _load_universes_from_db()
+    return _scanner.UNIVERSES
+
+UNIVERSES = _get_universes()
 import db as _db
+
+def _resolve_universe_tickers(universe_key: str) -> list:
+    """Resolve tickers for a universe key fresh from the shared DB on every call."""
+    universes = _load_universes_from_db()
+    tickers = universes.get(universe_key)
+    if tickers:
+        return tickers
+    # Fall back to scanner-level index universes (SP500, NDX100, etc.)
+    index = getattr(_scanner, "_INDEX_UNIVERSES", {})
+    return index.get(universe_key, [])
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -94,7 +112,7 @@ def _run_scan(universe_key: str, save_to_db: bool = False, tickers: list = None)
         logger.info("Already scanning %s — skipping", universe_key)
         return
     if not tickers:
-        tickers = UNIVERSES.get(universe_key)
+        tickers = _resolve_universe_tickers(universe_key)
     if not tickers:
         logger.warning("Unknown universe and no tickers provided: %s", universe_key)
         return
@@ -332,7 +350,9 @@ def trigger_scan():
     universe = body.get("universe", "portfolio")
     tickers  = body.get("tickers") or None
 
-    if not tickers and universe not in UNIVERSES:
+    if not tickers:
+        tickers = _resolve_universe_tickers(universe)
+    if not tickers:
         return jsonify({"error": f"Unknown universe: {universe}"}), 400
 
     if universe in SCANNING:
@@ -417,11 +437,18 @@ def get_earnings():
     3. Response always includes upcoming quarter data (live FMP for the 1 most
        recent upcoming row per ticker, so estimates stay fresh).
     """
-    tickers_raw = request.args.get("tickers", "")
-    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
-    if not tickers:
-        return jsonify({"error": "tickers param required (comma-separated)"}), 400
-    tickers = tickers[:80]
+    universe_key = request.args.get("universe", "")
+    tickers_raw  = request.args.get("tickers", "")
+
+    if universe_key and universe_key != "all":
+        tickers = _resolve_universe_tickers(universe_key)
+    elif tickers_raw:
+        tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    else:
+        # universe=all or no filter — return whatever is in the DB
+        tickers = _db.get_all_earnings_tickers()
+
+    tickers = tickers[:200]
 
     # 1. Read actuals from DB
     results = _db.get_earnings_db(tickers)

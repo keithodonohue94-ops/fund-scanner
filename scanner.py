@@ -18,8 +18,36 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Universe definitions ──────────────────────────────────────────────────────
-UNIVERSES = {
+# ── Universe definitions — loaded from shared DB ─────────────────────────────
+def _load_universes_from_db() -> dict:
+    """Load custom universe definitions from the shared PostgreSQL universes table.
+    Falls back to an empty dict if the DB is unavailable."""
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        logger.warning("DATABASE_URL not set — no universes loaded from DB")
+        return {}
+    try:
+        import psycopg2
+        import psycopg2.extras
+        import json as _json
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT key, tickers FROM universes WHERE is_index = 0 ORDER BY id")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        result = {r["key"]: _json.loads(r["tickers"]) for r in rows}
+        logger.info("Loaded %d universes from shared DB", len(result))
+        return result
+    except Exception as e:
+        logger.error("_load_universes_from_db failed: %s", e)
+        return {}
+
+
+UNIVERSES = _load_universes_from_db()
+
+# ── (kept for reference — no longer used as source of truth) ──────────────────
+_UNIVERSES_LEGACY = {
     "portfolio": [
         "ALAB","MRVL","CRDO","IREN","APLD","MU","GFS","FLNC",
         "AMD","MOD","TER","ARM","ANET","VICR","ORA","QCOM","STRL",

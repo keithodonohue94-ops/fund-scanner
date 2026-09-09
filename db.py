@@ -409,6 +409,19 @@ def upsert_earnings(ticker: str, rows: list) -> int:
         session.close()
 
 
+def get_all_earnings_tickers() -> list:
+    """Return all distinct tickers that have earnings rows in the DB."""
+    session = _Session()
+    try:
+        from sqlalchemy import text
+        rows = session.execute(text("SELECT DISTINCT ticker FROM earnings_surprises ORDER BY ticker")).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+    finally:
+        session.close()
+
+
 def get_earnings_db(tickers: list) -> dict:
     """
     Return earnings surprise rows from DB keyed by ticker.
