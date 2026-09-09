@@ -73,6 +73,11 @@ class FundamentalsSnapshot(Base):
     op_delta      = Column(Float)   # QoQ op margin change
     gm_delta      = Column(Float)   # QoQ gross margin change
 
+    # EPS components (for browser-side multiple recomputation)
+    ttm_eps        = Column(Float, nullable=True)
+    ntm_eps        = Column(Float, nullable=True)
+    eps_growth_rate = Column(Float, nullable=True)
+
     created_at    = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -200,6 +205,9 @@ def save_snapshot(universe: str, results: list):
                 "op_margin":      row.get("op_margin"),
                 "op_delta":       row.get("op_delta"),
                 "gm_delta":       row.get("gm_delta"),
+                "ttm_eps":        row.get("ttm_eps"),
+                "ntm_eps":        row.get("ntm_eps"),
+                "eps_growth_rate": row.get("eps_growth_rate"),
             }
 
             if existing:
@@ -279,6 +287,26 @@ def get_ticker_list(universe: str | None = None) -> list:
         if universe:
             q = q.filter(FundamentalsSnapshot.universe == universe)
         return sorted(r[0] for r in q.all())
+    finally:
+        session.close()
+
+
+
+def get_fundamentals_snapshot(universe: str) -> list:
+    """Return the latest snapshot for all tickers in a given universe."""
+    session = _Session()
+    try:
+        from sqlalchemy import text
+        rows = session.execute(text("""
+            SELECT DISTINCT ON (ticker) *
+            FROM fundamentals_snapshot
+            WHERE universe = :u
+            ORDER BY ticker, snapshot_date DESC
+        """), {"u": universe}).fetchall()
+        return [_row_to_dict(r) for r in rows]
+    except Exception as e:
+        print(f"[db] get_fundamentals_snapshot error: {e}")
+        return []
     finally:
         session.close()
 
@@ -575,4 +603,7 @@ def _row_to_dict(r: FundamentalsSnapshot) -> dict:
         "op_margin":      r.op_margin,
         "op_delta":       r.op_delta,
         "gm_delta":       r.gm_delta,
+        "ttm_eps":        r.ttm_eps,
+        "ntm_eps":        r.ntm_eps,
+        "eps_growth_rate": r.eps_growth_rate,
     }

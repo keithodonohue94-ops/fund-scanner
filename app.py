@@ -30,6 +30,29 @@ from scanner import (
     _fetch_quote, _fetch_price_target, _fetch_ratios, _fetch_political_trades,
 )
 
+
+def _purge_cloudflare_cache():
+    """Purge all Cloudflare cached content after nightly DB writes."""
+    import os, requests as _req
+    token = os.environ.get('CF_API_TOKEN', '')
+    zone  = '438f201792c897e59eca74ea26c35c1c'
+    if not token:
+        print('[CF purge] CF_API_TOKEN not set — skipping purge')
+        return
+    try:
+        r = _req.post(
+            f'https://api.cloudflare.com/client/v4/zones/{zone}/purge_cache',
+            headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+            json={'purge_everything': True},
+            timeout=15
+        )
+        if r.ok:
+            print('[CF purge] Cache purged successfully')
+        else:
+            print(f'[CF purge] FAILED: {r.status_code} {r.text[:200]}')
+    except Exception as e:
+        print(f'[CF purge] ERROR: {e}')
+
 def _get_universes():
     """Always fetch latest universe definitions from the shared DB."""
     _scanner.UNIVERSES = _load_universes_from_db()
@@ -242,8 +265,10 @@ def _background_scheduler():
         logger.info("EOD scan complete.")
 
         # ── Earnings: today's reporters + stale upcoming ──────────────────────
+        todays_reporters = set()
         try:
             todays   = _db.get_todays_reporters()
+            todays_reporters = todays  # save for EPS snapshot update below
             stale    = set(_db.get_stale_upcoming_tickers())
             to_fetch = sorted(todays | stale)
             if to_fetch:
@@ -252,6 +277,23 @@ def _background_scheduler():
                 logger.info("No earnings reporters today and no stale upcoming tickers.")
         except Exception as exc:
             logger.error("Nightly earnings fetch error: %s", exc)
+
+        # ── Re-fetch EPS snapshot for today's reporters ───────────────────────
+        if todays_reporters:
+            logger.info("Re-fetching fundamentals for %d today's reporters", len(todays_reporters))
+            from scanner import _fetch_all as _scan_one
+            _universes_now = _load_universes_from_db()
+            for _tk in sorted(todays_reporters):
+                try:
+                    _fresh = _scan_one(_tk)
+                    if _fresh and _fresh.get("price"):
+                        _fresh["ticker"] = _tk
+                        for _ukey, _tlist in _universes_now.items():
+                            if _tk in _tlist:
+                                _db.save_snapshot(_ukey, [_fresh])
+                    time.sleep(0.5)
+                except Exception as _exc:
+                    logger.warning("EPS re-fetch error %s: %s", _tk, _exc)
 
         # ── Political trades refresh ──────────────────────────────────────────
         try:
@@ -264,6 +306,8 @@ def _background_scheduler():
         # ── Weekly Sunday: refresh earnings calendar ──────────────────────────
         if date.today().weekday() == 6:  # 6 = Sunday
             _refresh_earnings_calendar()
+
+        _purge_cloudflare_cache()
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
@@ -486,7 +530,18 @@ def get_earnings():
                     confirmed = [r for r in existing if not r.get("is_upcoming")]
                     results[sym] = upcoming_rows + confirmed
 
-    return jsonify({"results": results, "count": len(results)})
+    resp = jsonify({"results": results, "count": len(results)})
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
+
+
+@app.route("/api/fundamentals")
+def get_fundamentals():
+    universe = request.args.get("universe", "portfolio")
+    rows = _db.get_fundamentals_snapshot(universe)
+    resp = jsonify({"results": rows, "universe": universe, "count": len(rows)})
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
 
 
 # ── Political trades ──────────────────────────────────────────────────────────
@@ -499,7 +554,9 @@ def get_political_trades():
     limit = min(int(request.args.get("limit", 2000)), 5000)
     try:
         data = _db.get_political_trades(tickers=tickers, limit=limit)
-        return jsonify({"results": data, "count": len(data)})
+        resp = jsonify({"results": data, "count": len(data)})
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        return resp
     except Exception as exc:
         logger.error("political-trades error: %s", exc)
         return jsonify({"error": str(exc)}), 500

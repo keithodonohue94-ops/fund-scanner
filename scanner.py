@@ -571,6 +571,11 @@ def _fetch_all(symbol: str) -> dict:
         "op_margin":      income.get("op_margin"),
         "op_delta":       income.get("op_delta"),
         "gm_delta":       income.get("gm_delta"),
+        "ttm_eps":        trailing_eps,
+        "ntm_eps":        fwd_eps,
+        "eps_growth_rate": (round(fwd_pe / (peg * 100), 6)
+                            if peg and fwd_pe and peg > 0 and peg_method != "fmp"
+                            else None),
     }
 
 
