@@ -103,6 +103,7 @@ class PoliticalTrade(Base):
     disc_date   = Column(String(10))                    # YYYY-MM-DD (disclosed / filed)
     lag_days    = Column(Integer)
     link        = Column(String(500))
+    sector      = Column(String(100))                   # Technology, Healthcare, …
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -111,6 +112,18 @@ class PoliticalTrade(Base):
         Index("ix_pol_disc_date", "disc_date"),
         Index("ix_pol_name",      "name"),
     )
+
+
+
+
+class TickerMetadata(Base):
+    """Shared ticker→sector/company_name cache. Populated on demand from FMP /profile."""
+    __tablename__ = "ticker_metadata"
+
+    ticker        = Column(String(20), primary_key=True)
+    company_name  = Column(String(500))
+    sector        = Column(String(100))
+    updated_at    = Column(DateTime, default=datetime.utcnow)
 
 
 class EarningsSurprise(Base):
@@ -160,8 +173,18 @@ class ReportCalendar(Base):
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def init_db():
-    """Create tables if they don't exist. Call once at startup."""
+    """Create tables if they don't exist and apply lightweight column migrations."""
     Base.metadata.create_all(_engine)
+    # ── Column migrations (idempotent ALTER TABLE) ─────────────────────────
+    # Add sector to political_trades if not present (new column, July 2025).
+    try:
+        with _engine.connect() as conn:
+            conn.execute(text("ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS sector VARCHAR(100)"))
+            conn.commit()
+    except Exception as exc:
+        # SQLite does not support IF NOT EXISTS; ignore "duplicate column" errors
+        if "duplicate" not in str(exc).lower() and "already exists" not in str(exc).lower():
+            logger.warning("sector column migration: %s", exc)
     logger.info("DB ready: %s", _DATABASE_URL.split("@")[-1])  # hide credentials
 
 
@@ -329,6 +352,9 @@ def upsert_political_trades(trades: list) -> int:
                 type=t.get("type", ""),
             ).first()
             if existing:
+                # Backfill sector if we now have it but the row doesn't
+                if t.get("sector") and not existing.sector:
+                    existing.sector = t.get("sector", "")
                 continue
             row = PoliticalTrade(
                 chamber    = t.get("chamber", ""),
@@ -343,6 +369,7 @@ def upsert_political_trades(trades: list) -> int:
                 disc_date  = t.get("disc_date", ""),
                 lag_days   = t.get("lag_days"),
                 link       = t.get("link", ""),
+                sector     = t.get("sector", ""),
             )
             session.add(row)
             inserted += 1
@@ -580,6 +607,7 @@ def _pol_row_to_dict(r: PoliticalTrade) -> dict:
         "disc_date":  r.disc_date,
         "lag_days":   r.lag_days,
         "link":       r.link,
+        "sector":     r.sector or "",
     }
 
 
@@ -607,3 +635,101 @@ def _row_to_dict(r: FundamentalsSnapshot) -> dict:
         "ntm_eps":        r.ntm_eps,
         "eps_growth_rate": r.eps_growth_rate,
     }
+
+# ── Ticker metadata (shared sector/company cache) ─────────────────────────────
+
+def get_tickers_missing_sector(tickers: list) -> list:
+    """Return subset of tickers that have no sector in ticker_metadata."""
+    if not tickers:
+        return []
+    session = _Session()
+    try:
+        rows = session.query(TickerMetadata.ticker).filter(
+            TickerMetadata.ticker.in_([t.upper() for t in tickers]),
+            TickerMetadata.sector.isnot(None),
+            TickerMetadata.sector != "",
+        ).all()
+        existing = {r[0] for r in rows}
+        return [t for t in tickers if t.upper() not in existing]
+    finally:
+        session.close()
+
+
+def upsert_ticker_metadata(profiles: dict):
+    """
+    Upsert ticker → {company_name, sector} into ticker_metadata.
+    profiles: {ticker: {company_name: str, sector: str}}
+    """
+    if not profiles:
+        return
+    session = _Session()
+    try:
+        for ticker, data in profiles.items():
+            ticker = ticker.upper()
+            existing = session.query(TickerMetadata).filter_by(ticker=ticker).first()
+            if existing:
+                if data.get("sector"):
+                    existing.sector = data["sector"]
+                if data.get("company_name"):
+                    existing.company_name = data["company_name"]
+                existing.updated_at = datetime.utcnow()
+            else:
+                session.add(TickerMetadata(
+                    ticker       = ticker,
+                    company_name = data.get("company_name", ""),
+                    sector       = data.get("sector", ""),
+                ))
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("upsert_ticker_metadata error: %s", exc)
+        raise
+    finally:
+        session.close()
+
+
+def get_ticker_sector_map(tickers: list) -> dict:
+    """Return {ticker: sector} for all tickers that have sector populated."""
+    if not tickers:
+        return {}
+    session = _Session()
+    try:
+        rows = session.query(TickerMetadata.ticker, TickerMetadata.sector).filter(
+            TickerMetadata.ticker.in_([t.upper() for t in tickers]),
+        ).all()
+        return {r[0]: r[1] or "" for r in rows}
+    finally:
+        session.close()
+
+
+def backfill_political_trade_sectors():
+    """
+    Update existing political_trades rows that have empty sector
+    using whatever is already in ticker_metadata.
+    Returns number of rows updated.
+    """
+    session = _Session()
+    updated = 0
+    try:
+        # Get all tickers in political_trades that lack sector
+        from sqlalchemy import text as _text
+        empty_rows = session.query(PoliticalTrade).filter(
+            (PoliticalTrade.sector == None) | (PoliticalTrade.sector == "")
+        ).all()
+        if not empty_rows:
+            return 0
+        tickers = list({r.ticker.upper() for r in empty_rows})
+        sector_map = get_ticker_sector_map(tickers)
+        for row in empty_rows:
+            s = sector_map.get(row.ticker.upper(), "")
+            if s:
+                row.sector = s
+                updated += 1
+        session.commit()
+        return updated
+    except Exception as exc:
+        session.rollback()
+        logger.error("backfill_political_trade_sectors error: %s", exc)
+        raise
+    finally:
+        session.close()

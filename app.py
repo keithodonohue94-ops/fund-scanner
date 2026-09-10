@@ -615,6 +615,34 @@ def refresh_political_trades():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/political-trades/backfill-sectors", methods=["POST"])
+def backfill_political_trade_sectors():
+    """POST /api/political-trades/backfill-sectors
+    1. Fetches FMP /profile for any ticker in political_trades not yet in ticker_metadata.
+    2. Backfills sector on existing political_trades rows that have empty sector.
+    """
+    from scanner import ensure_ticker_metadata
+    try:
+        # Collect all unique tickers in political_trades
+        session = _db._Session()
+        try:
+            tickers = [r[0] for r in session.query(_db.PoliticalTrade.ticker).distinct().all()]
+        finally:
+            session.close()
+        # Ensure sector data exists in ticker_metadata for all tickers
+        sector_map = ensure_ticker_metadata(tickers)
+        # Backfill empty sector on existing rows
+        updated = _db.backfill_political_trade_sectors()
+        return jsonify({
+            "status": "ok",
+            "tickers_resolved": len(sector_map),
+            "rows_updated": updated,
+        })
+    except Exception as exc:
+        logger.error("backfill-sectors error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
 # ── History endpoints ─────────────────────────────────────────────────────────
 
 @app.route("/api/history/ticker")
