@@ -631,8 +631,8 @@ def ensure_ticker_metadata(tickers: list) -> dict:
 def _fmp_historical_close(ticker: str, trade_date: str) -> float | None:
     """
     Fetch the EOD closing price for ticker on or just before trade_date.
-    Uses FMP /historical-price-full with a 5-day lookback window to handle
-    weekends and holidays (no close on non-trading days).
+    Uses FMP /stable/historical-price-eod/full with a 7-day lookback window
+    to handle weekends and holidays (no close on non-trading days).
     Returns float or None.
     """
     from datetime import datetime as _dt, timedelta as _td
@@ -641,12 +641,18 @@ def _fmp_historical_close(ticker: str, trade_date: str) -> float | None:
         from_dt = (d - _td(days=7)).strftime("%Y-%m-%d")
         to_dt   = d.strftime("%Y-%m-%d")
         data = _fmp_get(
-            f"{FMP_STABLE}/historical-price-full/{ticker.upper()}",
-            {"from": from_dt, "to": to_dt},
+            f"{FMP_STABLE}/historical-price-eod/full",
+            {"symbol": ticker.upper(), "from": from_dt, "to": to_dt},
         )
         if not data:
             return None
-        hist = data.get("historical") if isinstance(data, dict) else None
+        # Stable API returns a bare list; v3 wraps in {"historical": [...]}
+        if isinstance(data, dict):
+            hist = data.get("historical") or []
+        elif isinstance(data, list):
+            hist = data
+        else:
+            hist = []
         if not hist:
             return None
         # Sort descending, take most recent date ≤ trade_date
