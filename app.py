@@ -28,6 +28,7 @@ from scanner import (
     scan_tickers, _load_universes_from_db,
     _fetch_earnings_surprises, _fetch_earnings_calendar,
     _fetch_quote, _fetch_price_target, _fetch_ratios, _fetch_political_trades,
+    backfill_trade_prices, refresh_last_prices,
 )
 
 
@@ -100,7 +101,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -640,6 +641,55 @@ def backfill_political_trade_sectors():
         })
     except Exception as exc:
         logger.error("backfill-sectors error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/political-trades/backfill-prices", methods=["POST"])
+def backfill_trade_prices_endpoint():
+    """
+    POST /api/political-trades/backfill-prices
+    Fetches AT-TRADE (EOD close on trade_date) and LAST prices for up to 200 trades
+    that don't have price_at_trade set yet. Safe to call multiple times — only
+    processes rows still missing prices.
+    """
+    batch = min(int(request.args.get("batch", 200)), 500)
+    try:
+        result = backfill_trade_prices(batch_size=batch)
+        counts = _db.get_political_trades_count()
+        return jsonify({"status": "ok", **result, **counts})
+    except Exception as exc:
+        logger.error("backfill-prices error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/political-trades/refresh-last-prices", methods=["POST"])
+def refresh_last_prices_endpoint():
+    """
+    POST /api/political-trades/refresh-last-prices
+    Updates price_last for all political_trades that have price_at_trade set.
+    Run periodically to keep return% calculations current.
+    """
+    try:
+        updated = refresh_last_prices()
+        return jsonify({"status": "ok", "updated": updated})
+    except Exception as exc:
+        logger.error("refresh-last-prices error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/political-trades/leaderboard", methods=["GET"])
+def political_trades_leaderboard():
+    """
+    GET /api/political-trades/leaderboard
+    Returns per-politician win rate, avg direction-adjusted return, trade counts.
+    Only politicians with ≥3 priced trades are included.
+    """
+    try:
+        leaderboard = _db.get_political_leaderboard()
+        counts      = _db.get_political_trades_count()
+        return jsonify({"status": "ok", "leaderboard": leaderboard, **counts})
+    except Exception as exc:
+        logger.error("leaderboard error: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
 

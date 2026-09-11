@@ -626,6 +626,165 @@ def ensure_ticker_metadata(tickers: list) -> dict:
     return _db.get_ticker_sector_map(list(tickers))
 
 
+# ── Political trade price helpers ────────────────────────────────────────────
+
+def _fmp_historical_close(ticker: str, trade_date: str) -> float | None:
+    """
+    Fetch the EOD closing price for ticker on or just before trade_date.
+    Uses FMP /historical-price-full with a 5-day lookback window to handle
+    weekends and holidays (no close on non-trading days).
+    Returns float or None.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        d = _dt.strptime(trade_date[:10], "%Y-%m-%d")
+        from_dt = (d - _td(days=7)).strftime("%Y-%m-%d")
+        to_dt   = d.strftime("%Y-%m-%d")
+        data = _fmp_get(
+            f"{FMP_STABLE}/historical-price-full/{ticker.upper()}",
+            {"from": from_dt, "to": to_dt},
+        )
+        if not data:
+            return None
+        hist = data.get("historical") if isinstance(data, dict) else None
+        if not hist:
+            return None
+        # Sort descending, take most recent date ≤ trade_date
+        hist.sort(key=lambda r: r.get("date", ""), reverse=True)
+        for row in hist:
+            if row.get("date", "") <= trade_date[:10]:
+                return _safe_float(row.get("close") or row.get("adjClose"))
+        return None
+    except Exception as exc:
+        logger.warning("_fmp_historical_close %s %s: %s", ticker, trade_date, exc)
+        return None
+
+
+def backfill_trade_prices(batch_size: int = 200) -> dict:
+    """
+    Fill price_at_trade (historical EOD close on trade_date) and price_last
+    (current quote) for political trades that are missing price_at_trade.
+    Returns {filled_at, filled_last, errors}.
+    """
+    import db as _db
+    import time as _time
+
+    missing = _db.get_trades_missing_at_price(limit=batch_size)
+    if not missing:
+        logger.info("backfill_trade_prices: nothing to do")
+        return {"filled_at": 0, "filled_last": 0, "errors": 0}
+
+    logger.info("backfill_trade_prices: %d trades to price", len(missing))
+
+    updates = []
+    errors  = 0
+
+    # 1. AT-TRADE prices (historical close)
+    for row in missing:
+        try:
+            price = _fmp_historical_close(row["ticker"], row["trade_date"])
+            if price:
+                updates.append({"id": row["id"], "price_at_trade": price})
+            else:
+                errors += 1
+        except Exception as exc:
+            logger.warning("AT-TRADE price %s %s: %s", row["ticker"], row["trade_date"], exc)
+            errors += 1
+        _time.sleep(0.12)  # FMP rate limit
+
+    # 2. Current (LAST) prices — batch by ticker
+    tickers   = list({r["ticker"].upper() for r in missing})
+    id_ticker = {r["id"]: r["ticker"].upper() for r in missing}
+    last_map  = {}
+    for ticker in tickers:
+        q = _fmp_get(f"{FMP_STABLE}/quote", {"symbol": ticker})
+        if isinstance(q, list) and q:
+            p = _safe_float(q[0].get("price"))
+        elif isinstance(q, dict):
+            p = _safe_float(q.get("price"))
+        else:
+            p = None
+        if p:
+            last_map[ticker] = p
+        _time.sleep(0.1)
+
+    # Merge last prices into updates list
+    existing_ids = {u["id"] for u in updates}
+    for row in missing:
+        last = last_map.get(row["ticker"].upper())
+        if not last:
+            continue
+        if row["id"] in existing_ids:
+            for u in updates:
+                if u["id"] == row["id"]:
+                    u["price_last"] = last
+                    break
+        else:
+            updates.append({"id": row["id"], "price_last": last})
+
+    filled_at   = sum(1 for u in updates if u.get("price_at_trade"))
+    filled_last = sum(1 for u in updates if u.get("price_last"))
+
+    if updates:
+        _db.bulk_update_trade_prices(updates)
+
+    logger.info("backfill_trade_prices done: filled_at=%d filled_last=%d errors=%d",
+                filled_at, filled_last, errors)
+    return {"filled_at": filled_at, "filled_last": filled_last, "errors": errors}
+
+
+def refresh_last_prices() -> int:
+    """
+    Update price_last for all political_trades that have price_at_trade set.
+    Fetches current quotes from FMP for each distinct ticker.
+    Returns count of rows updated.
+    """
+    import db as _db
+    import time as _time
+
+    session = _db._Session()
+    try:
+        rows = session.query(
+            _db.PoliticalTrade.id,
+            _db.PoliticalTrade.ticker,
+        ).filter(
+            _db.PoliticalTrade.price_at_trade != None,
+        ).all()
+    finally:
+        session.close()
+
+    if not rows:
+        return 0
+
+    tickers = list({r[1].upper() for r in rows})
+    logger.info("refresh_last_prices: fetching current quotes for %d tickers", len(tickers))
+
+    last_map = {}
+    for ticker in tickers:
+        q = _fmp_get(f"{FMP_STABLE}/quote", {"symbol": ticker})
+        if isinstance(q, list) and q:
+            p = _safe_float(q[0].get("price"))
+        elif isinstance(q, dict):
+            p = _safe_float(q.get("price"))
+        else:
+            p = None
+        if p:
+            last_map[ticker] = p
+        _time.sleep(0.1)
+
+    updates = []
+    for row_id, ticker in rows:
+        last = last_map.get(ticker.upper())
+        if last:
+            updates.append({"id": row_id, "price_last": last})
+
+    if updates:
+        _db.bulk_update_trade_prices(updates)
+
+    logger.info("refresh_last_prices done: %d rows updated", len(updates))
+    return len(updates)
+
+
 # ── Political trades ──────────────────────────────────────────────────────────
 
 def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:

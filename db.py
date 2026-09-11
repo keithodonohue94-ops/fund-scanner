@@ -104,6 +104,9 @@ class PoliticalTrade(Base):
     lag_days    = Column(Integer)
     link        = Column(String(500))
     sector      = Column(String(100))                   # Technology, Healthcare, …
+    price_at_trade     = Column(Float)                  # EOD close on trade_date
+    price_last         = Column(Float)                  # Most recent closing price
+    price_last_updated = Column(DateTime)               # When price_last was fetched
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -177,14 +180,20 @@ def init_db():
     Base.metadata.create_all(_engine)
     # ── Column migrations (idempotent ALTER TABLE) ─────────────────────────
     # Add sector to political_trades if not present (new column, July 2025).
-    try:
-        with _engine.connect() as conn:
-            conn.execute(text("ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS sector VARCHAR(100)"))
-            conn.commit()
-    except Exception as exc:
-        # SQLite does not support IF NOT EXISTS; ignore "duplicate column" errors
-        if "duplicate" not in str(exc).lower() and "already exists" not in str(exc).lower():
-            logger.warning("sector column migration: %s", exc)
+    _migrations = [
+        "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS sector VARCHAR(100)",
+        "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_at_trade FLOAT",
+        "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_last FLOAT",
+        "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_last_updated TIMESTAMP",
+    ]
+    for sql in _migrations:
+        try:
+            with _engine.connect() as conn:
+                conn.execute(text(sql))
+                conn.commit()
+        except Exception as exc:
+            if "duplicate" not in str(exc).lower() and "already exists" not in str(exc).lower():
+                logger.warning("Migration failed (%s): %s", sql[:60], exc)
     logger.info("DB ready: %s", _DATABASE_URL.split("@")[-1])  # hide credentials
 
 
@@ -595,19 +604,22 @@ def get_todays_reporters() -> set:
 
 def _pol_row_to_dict(r: PoliticalTrade) -> dict:
     return {
-        "chamber":    r.chamber,
-        "name":       r.name,
-        "party":      r.party,
-        "district":   r.district,
-        "ticker":     r.ticker,
-        "asset":      r.asset,
-        "type":       r.type,
-        "amount":     r.amount,
-        "trade_date": r.trade_date,
-        "disc_date":  r.disc_date,
-        "lag_days":   r.lag_days,
-        "link":       r.link,
-        "sector":     r.sector or "",
+        "chamber":           r.chamber,
+        "name":              r.name,
+        "party":             r.party,
+        "district":          r.district,
+        "ticker":            r.ticker,
+        "asset":             r.asset,
+        "type":              r.type,
+        "amount":            r.amount,
+        "trade_date":        r.trade_date,
+        "disc_date":         r.disc_date,
+        "lag_days":          r.lag_days,
+        "link":              r.link,
+        "sector":            r.sector or "",
+        "price_at_trade":    r.price_at_trade,
+        "price_last":        r.price_last,
+        "price_last_updated": r.price_last_updated.isoformat() if r.price_last_updated else None,
     }
 
 
@@ -698,6 +710,157 @@ def get_ticker_sector_map(tickers: list) -> dict:
             TickerMetadata.ticker.in_([t.upper() for t in tickers]),
         ).all()
         return {r[0]: r[1] or "" for r in rows}
+    finally:
+        session.close()
+
+
+def get_trades_missing_at_price(limit: int = 500) -> list:
+    """Return list of {id, ticker, trade_date} for trades that have no price_at_trade yet."""
+    session = _Session()
+    try:
+        rows = session.query(
+            PoliticalTrade.id,
+            PoliticalTrade.ticker,
+            PoliticalTrade.trade_date,
+        ).filter(
+            PoliticalTrade.price_at_trade == None,
+            PoliticalTrade.trade_date != None,
+            PoliticalTrade.trade_date != "",
+        ).limit(limit).all()
+        return [{"id": r[0], "ticker": r[1], "trade_date": r[2]} for r in rows]
+    finally:
+        session.close()
+
+
+def bulk_update_trade_prices(updates: list) -> int:
+    """
+    Batch-update price_at_trade and/or price_last on PoliticalTrade rows.
+    updates: list of {id, price_at_trade?, price_last?} — only non-None fields are written.
+    Returns number of rows touched.
+    """
+    if not updates:
+        return 0
+    session = _Session()
+    touched = 0
+    try:
+        for u in updates:
+            trade_id = u.get("id")
+            if not trade_id:
+                continue
+            row = session.query(PoliticalTrade).filter_by(id=trade_id).first()
+            if not row:
+                continue
+            if u.get("price_at_trade") is not None:
+                row.price_at_trade = u["price_at_trade"]
+            if u.get("price_last") is not None:
+                row.price_last = u["price_last"]
+                row.price_last_updated = datetime.utcnow()
+            touched += 1
+        session.commit()
+        return touched
+    except Exception as exc:
+        session.rollback()
+        logger.error("bulk_update_trade_prices error: %s", exc)
+        raise
+    finally:
+        session.close()
+
+
+def get_political_leaderboard() -> list:
+    """
+    Compute per-politician performance stats from stored prices.
+    Only includes politicians with ≥3 priced trades to keep stats meaningful.
+    Returns list of dicts sorted by win_rate desc.
+
+    Win logic (direction-adjusted):
+      - BUY wins if price_last > price_at_trade  (return > 0)
+      - SELL wins if price_last < price_at_trade (return < 0, i.e. price fell after sale)
+    """
+    from collections import defaultdict
+    session = _Session()
+    try:
+        rows = session.query(PoliticalTrade).filter(
+            PoliticalTrade.price_at_trade != None,
+            PoliticalTrade.price_last != None,
+            PoliticalTrade.price_at_trade > 0,
+        ).all()
+
+        by_pol = defaultdict(list)
+        for r in rows:
+            by_pol[(r.name, r.party, r.chamber)].append(r)
+
+        leaderboard = []
+        for (name, party, chamber), trades in by_pol.items():
+            if len(trades) < 3:
+                continue
+
+            wins = 0
+            adj_returns = []
+            buy_count = sell_count = 0
+            trade_detail = []
+
+            for t in trades:
+                raw_pct = (t.price_last - t.price_at_trade) / t.price_at_trade * 100
+                is_sale = "sale" in (t.type or "").lower()
+                if is_sale:
+                    sell_count += 1
+                    adj = -raw_pct   # positive = price fell after sale = win
+                else:
+                    buy_count += 1
+                    adj = raw_pct    # positive = price rose after buy = win
+
+                if adj > 0:
+                    wins += 1
+                adj_returns.append(adj)
+                trade_detail.append({
+                    "ticker":     t.ticker,
+                    "adj_return": adj,
+                    "type":       t.type,
+                    "trade_date": t.trade_date,
+                    "sector":     t.sector or "",
+                })
+
+            total    = len(trades)
+            win_rate = wins / total * 100
+            avg_ret  = sum(adj_returns) / total
+
+            trade_detail.sort(key=lambda x: x["adj_return"], reverse=True)
+            best  = trade_detail[0]
+            worst = trade_detail[-1]
+
+            leaderboard.append({
+                "name":         name,
+                "party":        party,
+                "chamber":      chamber,
+                "total":        total,
+                "wins":         wins,
+                "win_rate":     round(win_rate, 1),
+                "avg_return":   round(avg_ret, 1),
+                "buy_count":    buy_count,
+                "sell_count":   sell_count,
+                "best_ticker":  best["ticker"],
+                "best_return":  round(best["adj_return"], 1),
+                "best_date":    best["trade_date"],
+                "worst_ticker": worst["ticker"],
+                "worst_return": round(worst["adj_return"], 1),
+                "worst_date":   worst["trade_date"],
+            })
+
+        leaderboard.sort(key=lambda x: (x["win_rate"], x["avg_return"]), reverse=True)
+        return leaderboard
+    finally:
+        session.close()
+
+
+def get_political_trades_count() -> dict:
+    """Return count of priced vs total political trades (for backfill progress)."""
+    session = _Session()
+    try:
+        total   = session.query(PoliticalTrade).count()
+        priced  = session.query(PoliticalTrade).filter(
+            PoliticalTrade.price_at_trade != None
+        ).count()
+        return {"total": total, "priced": priced}
     finally:
         session.close()
 
