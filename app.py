@@ -696,7 +696,9 @@ def political_trades_leaderboard():
         year        = request.args.get("year", type=int)
         leaderboard = _db.get_political_leaderboard(year=year)
         counts      = _db.get_political_trades_count()
-        return jsonify({"status": "ok", "leaderboard": leaderboard, "year_filter": year, **counts})
+        resp = jsonify({"status": "ok", "leaderboard": leaderboard, "year_filter": year, **counts})
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        return resp
     except Exception as exc:
         logger.error("leaderboard error: %s", exc)
         return jsonify({"error": str(exc)}), 500
