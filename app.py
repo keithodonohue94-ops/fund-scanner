@@ -304,6 +304,13 @@ def _background_scheduler():
         except Exception as exc:
             logger.error("Political trades refresh error: %s", exc)
 
+        # ── Political trades: refresh price_last for all priced rows ──────────
+        try:
+            updated = refresh_last_prices()
+            logger.info("Political trades refresh-last-prices — %d rows updated", updated)
+        except Exception as exc:
+            logger.error("Political trades refresh-last-prices error: %s", exc)
+
         # ── Weekly Sunday: refresh earnings calendar ──────────────────────────
         if date.today().weekday() == 6:  # 6 = Sunday
             _refresh_earnings_calendar()
@@ -680,14 +687,16 @@ def refresh_last_prices_endpoint():
 @app.route("/api/political-trades/leaderboard", methods=["GET"])
 def political_trades_leaderboard():
     """
-    GET /api/political-trades/leaderboard
+    GET /api/political-trades/leaderboard?year=2026
     Returns per-politician win rate, avg direction-adjusted return, trade counts.
     Only politicians with ≥3 priced trades are included.
+    Optional ?year=YYYY filters to trades in that calendar year only.
     """
     try:
-        leaderboard = _db.get_political_leaderboard()
+        year        = request.args.get("year", type=int)
+        leaderboard = _db.get_political_leaderboard(year=year)
         counts      = _db.get_political_trades_count()
-        return jsonify({"status": "ok", "leaderboard": leaderboard, **counts})
+        return jsonify({"status": "ok", "leaderboard": leaderboard, "year_filter": year, **counts})
     except Exception as exc:
         logger.error("leaderboard error: %s", exc)
         return jsonify({"error": str(exc)}), 500
