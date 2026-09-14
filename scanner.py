@@ -950,3 +950,115 @@ def scan_tickers(tickers: list, delay: float = 0) -> list:
     order = {sym: i for i, sym in enumerate(tickers)}
     results.sort(key=lambda r: order.get(r["ticker"], 9999))
     return results
+
+
+# ── Historical political trades backfill ─────────────────────────────────────
+
+def fetch_political_trades_historical(from_date: str = "2025-01-01", max_pages: int = 150) -> list:
+    """
+    Fetch ALL Senate + House trading disclosures from FMP paginated endpoints
+    (no symbol filter) going back to from_date (trade_date >= from_date).
+
+    Pages through results newest-first, stopping once all trades in a page
+    predate from_date. Safe to call multiple times — upsert handles dedup.
+
+    Returns list of normalised dicts (same schema as _fetch_political_trades).
+    """
+    from datetime import datetime as _dt
+    import time as _time
+
+    CUTOFF = from_date[:10]
+
+    def _lag(trade_date: str, disc_date: str):
+        try:
+            td = _dt.strptime(trade_date[:10], "%Y-%m-%d")
+            dd = _dt.strptime(disc_date[:10], "%Y-%m-%d")
+            return (dd - td).days
+        except Exception:
+            return None
+
+    def _normalise_senate(row, ticker):
+        trade_dt = (row.get("transactionDate") or "")[:10]
+        disc_dt  = (row.get("dateRecieved") or row.get("disclosureDate") or "")[:10]
+        return {
+            "chamber":    "Senate",
+            "name":       row.get("office") or (row.get("firstName", "") + " " + row.get("lastName", "")).strip() or "—",
+            "party":      row.get("party") or "",
+            "district":   row.get("district") or "",
+            "ticker":     ticker,
+            "asset":      row.get("assetDescription") or row.get("asset") or "",
+            "type":       row.get("type") or "",
+            "amount":     row.get("amount") or "",
+            "trade_date": trade_dt,
+            "disc_date":  disc_dt,
+            "lag_days":   _lag(trade_dt, disc_dt),
+            "link":       row.get("link") or "",
+        }
+
+    def _normalise_house(row, ticker):
+        trade_dt = (row.get("transactionDate") or "")[:10]
+        disc_dt  = (row.get("disclosureDate") or row.get("dateRecieved") or "")[:10]
+        return {
+            "chamber":    "House",
+            "name":       row.get("office") or (row.get("firstName", "") + " " + row.get("lastName", "")).strip() or "—",
+            "party":      row.get("party") or "",
+            "district":   row.get("district") or row.get("state") or "",
+            "ticker":     ticker,
+            "asset":      row.get("assetDescription") or row.get("asset") or "",
+            "type":       row.get("type") or "",
+            "amount":     row.get("amount") or "",
+            "trade_date": trade_dt,
+            "disc_date":  disc_dt,
+            "lag_days":   _lag(trade_dt, disc_dt),
+            "link":       row.get("link") or "",
+        }
+
+    seen = set()
+    results = []
+
+    for chamber, endpoint, normalise_fn in [
+        ("Senate", f"{FMP_STABLE}/senate-trades", _normalise_senate),
+        ("House",  f"{FMP_STABLE}/house-trades",  _normalise_house),
+    ]:
+        for page in range(max_pages):
+            raw = _fmp_get(endpoint, {"page": page}) or []
+            if isinstance(raw, dict):
+                raw = raw.get("data", []) or []
+            if not raw:
+                logger.info("Historical backfill %s — no data at page %d, stopping", chamber, page)
+                break
+
+            page_past_cutoff = 0
+            for row in raw:
+                trade_dt = (row.get("transactionDate") or "")[:10]
+                ticker   = (row.get("ticker") or row.get("symbol") or "").upper().strip()
+                if not ticker or not trade_dt:
+                    continue
+                if trade_dt < CUTOFF:
+                    page_past_cutoff += 1
+                    continue
+                key = (chamber, row.get("office") or "", ticker, trade_dt, row.get("type") or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(normalise_fn(row, ticker))
+
+            logger.info("Historical backfill %s page %d — %d in window, %d past cutoff",
+                        chamber, page, len(raw) - page_past_cutoff, page_past_cutoff)
+
+            # If every row on this page predates cutoff we're done for this chamber
+            if page_past_cutoff == len(raw):
+                logger.info("Historical backfill %s — reached cutoff at page %d", chamber, page)
+                break
+
+            _time.sleep(0.2)  # stay within FMP rate limits
+
+    # Enrich sectors
+    all_tickers_seen = list({r["ticker"] for r in results})
+    sector_map = ensure_ticker_metadata(all_tickers_seen)
+    for r in results:
+        r["sector"] = sector_map.get(r["ticker"].upper(), "")
+
+    results.sort(key=lambda x: x.get("disc_date") or "", reverse=True)
+    logger.info("Historical backfill complete — %d total records (from_date=%s)", len(results), from_date)
+    return results

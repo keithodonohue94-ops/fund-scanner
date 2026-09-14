@@ -29,6 +29,7 @@ from scanner import (
     _fetch_earnings_surprises, _fetch_earnings_calendar,
     _fetch_quote, _fetch_price_target, _fetch_ratios, _fetch_political_trades,
     backfill_trade_prices, refresh_last_prices,
+    fetch_political_trades_historical,
 )
 
 
@@ -101,7 +102,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -580,6 +581,23 @@ def backfill_political_trades():
         logger.info("Political trades backfill done — %d fetched, %d new", len(trades), inserted)
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "backfill_started"})
+
+
+@app.route("/api/political-trades/backfill-historical", methods=["POST"])
+def backfill_political_trades_historical():
+    """
+    POST /api/political-trades/backfill-historical?from_date=2025-01-01
+    Pages through FMP senate + house endpoints (no symbol filter) and upserts
+    all trades with trade_date >= from_date. Runs in background thread.
+    """
+    from_date = request.args.get("from_date", "2025-01-01")
+    def _run():
+        logger.info("Historical political trades backfill started (from_date=%s)", from_date)
+        trades   = fetch_political_trades_historical(from_date=from_date)
+        inserted = _db.upsert_political_trades(trades)
+        logger.info("Historical backfill done — %d fetched, %d new", len(trades), inserted)
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "historical_backfill_started", "from_date": from_date})
 
 
 @app.route("/api/political-trades/clear")
