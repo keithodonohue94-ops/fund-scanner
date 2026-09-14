@@ -65,14 +65,9 @@ UNIVERSES = _get_universes()
 import db as _db
 
 def _resolve_universe_tickers(universe_key: str) -> list:
-    """Resolve tickers for a universe key fresh from the shared DB on every call."""
+    """Resolve tickers for a universe key from the shared DB (single source of truth)."""
     universes = _load_universes_from_db()
-    tickers = universes.get(universe_key)
-    if tickers:
-        return tickers
-    # Fall back to scanner-level index universes (SP500, NDX100, etc.)
-    index = getattr(_scanner, "_INDEX_UNIVERSES", {})
-    return index.get(universe_key, [])
+    return universes.get(universe_key, [])
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
