@@ -30,6 +30,7 @@ from scanner import (
     _fetch_quote, _fetch_price_target, _fetch_ratios, _fetch_political_trades,
     backfill_trade_prices, refresh_last_prices,
     fetch_political_trades_historical,
+    fetch_forward_prices,
 )
 
 
@@ -102,7 +103,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -598,6 +599,50 @@ def backfill_political_trades_historical():
         logger.info("Historical backfill done — %d fetched, %d new", len(trades), inserted)
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "historical_backfill_started", "from_date": from_date})
+
+
+@app.route("/api/political-trades/backfill-forward-prices", methods=["POST"])
+def backfill_political_trades_forward_prices():
+    """
+    POST /api/political-trades/backfill-forward-prices
+    Fetches EOD close price 30 and 60 days after trade_date for all purchase rows
+    that are missing price_30d. Runs in background thread.
+    """
+    def _run():
+        from scanner import fetch_forward_prices
+        session = _db._Session()
+        try:
+            rows = session.query(_db.PoliticalTrade).filter(
+                _db.PoliticalTrade.price_30d == None,
+                _db.PoliticalTrade.trade_date != None,
+                _db.PoliticalTrade.ticker != None,
+            ).all()
+            trades = [{"id": r.id, "ticker": r.ticker, "trade_date": r.trade_date} for r in rows]
+            session.close()
+            logger.info("backfill-forward-prices — %d rows to price", len(trades))
+            priced = fetch_forward_prices(trades)
+            session2 = _db._Session()
+            updated = 0
+            for p in priced:
+                if p.get("id") is None:
+                    continue
+                row = session2.query(_db.PoliticalTrade).filter_by(id=p["id"]).first()
+                if not row:
+                    continue
+                if p.get("price_30d") is not None:
+                    row.price_30d = p["price_30d"]
+                if p.get("price_60d") is not None:
+                    row.price_60d = p["price_60d"]
+                updated += 1
+            session2.commit()
+            session2.close()
+            logger.info("backfill-forward-prices done — %d rows updated", updated)
+        except Exception as exc:
+            logger.error("backfill-forward-prices error: %s", exc)
+            try: session.close()
+            except: pass
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "forward_price_backfill_started"})
 
 
 @app.route("/api/political-trades/clear")

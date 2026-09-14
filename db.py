@@ -107,6 +107,8 @@ class PoliticalTrade(Base):
     price_at_trade     = Column(Float)                  # EOD close on trade_date
     price_last         = Column(Float)                  # Most recent closing price
     price_last_updated = Column(DateTime)               # When price_last was fetched
+    price_30d          = Column(Float)                  # EOD close ~30 days after trade_date
+    price_60d          = Column(Float)                  # EOD close ~60 days after trade_date
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -185,6 +187,8 @@ def init_db():
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_at_trade FLOAT",
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_last FLOAT",
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_last_updated TIMESTAMP",
+        "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_30d FLOAT",
+        "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_60d FLOAT",
     ]
     for sql in _migrations:
         try:
@@ -620,6 +624,8 @@ def _pol_row_to_dict(r: PoliticalTrade) -> dict:
         "price_at_trade":    r.price_at_trade,
         "price_last":        r.price_last,
         "price_last_updated": r.price_last_updated.isoformat() if r.price_last_updated else None,
+        "price_30d":         r.price_30d,
+        "price_60d":         r.price_60d,
     }
 
 
@@ -766,7 +772,7 @@ def bulk_update_trade_prices(updates: list) -> int:
         session.close()
 
 
-def get_political_leaderboard() -> list:
+def get_political_leaderboard(year: int = None) -> list:
     """
     Compute per-politician performance stats from stored prices.
     Only includes politicians with ≥3 priced trades to keep stats meaningful.
@@ -775,15 +781,20 @@ def get_political_leaderboard() -> list:
     Win logic (direction-adjusted):
       - BUY wins if price_last > price_at_trade  (return > 0)
       - SELL wins if price_last < price_at_trade (return < 0, i.e. price fell after sale)
+
+    year: optional int — if set, only trades with trade_date starting with that year are counted.
     """
     from collections import defaultdict
     session = _Session()
     try:
-        rows = session.query(PoliticalTrade).filter(
+        q = session.query(PoliticalTrade).filter(
             PoliticalTrade.price_at_trade != None,
             PoliticalTrade.price_last != None,
             PoliticalTrade.price_at_trade > 0,
-        ).all()
+        )
+        if year:
+            q = q.filter(PoliticalTrade.trade_date.like(f"{year}%"))
+        rows = q.all()
 
         by_pol = defaultdict(list)
         for r in rows:

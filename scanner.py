@@ -1062,3 +1062,78 @@ def fetch_political_trades_historical(from_date: str = "2025-01-01", max_pages: 
     results.sort(key=lambda x: x.get("disc_date") or "", reverse=True)
     logger.info("Historical backfill complete — %d total records (from_date=%s)", len(results), from_date)
     return results
+
+
+def fetch_forward_prices(trades: list, day_offsets: tuple = (30, 60)) -> list:
+    """
+    For each trade dict (must have 'ticker' and 'trade_date'), fetch the EOD
+    closing price at each offset (30d, 60d after trade_date) from FMP historical.
+
+    Returns list of dicts:
+        { "id": trade_id, "ticker": ..., "trade_date": ...,
+          "price_30d": float|None, "price_60d": float|None }
+
+    Uses /stable/historical-price-eod/full?symbol=TICKER&from=...&to=...
+    Batches by ticker to minimise FMP calls.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    import time as _time
+
+    def _offset_close(history: list, trade_dt_str: str, offset_days: int) -> float | None:
+        """Find closing price on or just after trade_date + offset_days."""
+        try:
+            base = _dt.strptime(trade_dt_str[:10], "%Y-%m-%d")
+            target = base + _td(days=offset_days)
+            target_str = target.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+        # history is sorted newest-first; walk backwards to find first date >= target
+        # Actually we want the first trading day ON or AFTER target
+        candidates = [h for h in history if (h.get("date") or "") >= target_str]
+        if not candidates:
+            return None
+        # candidates sorted newest-first, so take the last one (closest to target)
+        closest = min(candidates, key=lambda h: h.get("date") or "")
+        return closest.get("close") or closest.get("adjClose") or None
+
+    # Group trades by ticker to batch FMP calls
+    by_ticker: dict[str, list] = {}
+    for t in trades:
+        tk = (t.get("ticker") or "").upper().strip()
+        if tk:
+            by_ticker.setdefault(tk, []).append(t)
+
+    results = []
+
+    for ticker, ticker_trades in by_ticker.items():
+        # Determine date window needed for this ticker's trades
+        dates = [t["trade_date"][:10] for t in ticker_trades if t.get("trade_date")]
+        if not dates:
+            continue
+        earliest = min(dates)
+        # We need up to 90 days after the latest trade date
+        try:
+            latest_dt = _dt.strptime(max(dates), "%Y-%m-%d") + _td(days=max(day_offsets) + 10)
+            to_str = min(latest_dt, _dt.utcnow()).strftime("%Y-%m-%d")
+        except Exception:
+            to_str = _dt.utcnow().strftime("%Y-%m-%d")
+
+        history = _fmp_get(
+            f"{FMP_STABLE}/historical-price-eod/full",
+            {"symbol": ticker, "from": earliest, "to": to_str}
+        ) or []
+        # FMP sometimes wraps in {"historical": [...]}
+        if isinstance(history, dict):
+            history = history.get("historical") or history.get("data") or []
+
+        for t in ticker_trades:
+            row = {"id": t.get("id"), "ticker": ticker, "trade_date": t.get("trade_date")}
+            for offset in day_offsets:
+                key = f"price_{offset}d"
+                row[key] = _offset_close(history, t.get("trade_date", ""), offset)
+            results.append(row)
+
+        _time.sleep(0.15)  # rate limit
+
+    logger.info("fetch_forward_prices complete — %d trades, %d tickers", len(trades), len(by_ticker))
+    return results
