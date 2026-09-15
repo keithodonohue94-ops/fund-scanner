@@ -189,6 +189,14 @@ def init_db():
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_last_updated TIMESTAMP",
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_30d FLOAT",
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_60d FLOAT",
+        # fundamentals_snapshot columns added Sep 2026
+        "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS avg_pt FLOAT",
+        "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS pt_pct FLOAT",
+        "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS op_delta FLOAT",
+        "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS gm_delta FLOAT",
+        "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS ttm_eps FLOAT",
+        "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS ntm_eps FLOAT",
+        "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS eps_growth_rate FLOAT",
     ]
     for sql in _migrations:
         try:
