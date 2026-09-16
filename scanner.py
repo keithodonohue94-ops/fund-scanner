@@ -793,7 +793,7 @@ def refresh_last_prices() -> int:
 
 # ── Political trades ──────────────────────────────────────────────────────────
 
-def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
+def _fetch_political_trades(tickers: set = None, limit: int = None) -> list:
     """
     Fetch Senate + House trading disclosures from FMP per-symbol endpoints.
     tickers: set of uppercase ticker symbols to fetch. If None, returns empty.
@@ -878,7 +878,7 @@ def _fetch_political_trades(tickers: set = None, limit: int = 500) -> list:
         r["sector"] = sector_map.get(r["ticker"].upper(), "")
 
     results.sort(key=lambda x: x.get("disc_date") or "", reverse=True)
-    return results[:limit]
+    return results if limit is None else results[:limit]
 
 
 # ── Earnings calendar ────────────────────────────────────────────────────────

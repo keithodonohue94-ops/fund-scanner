@@ -572,7 +572,7 @@ def backfill_political_trades():
     """POST /api/political-trades/backfill — fetch up to 1000 records, upsert."""
     def _run():
         logger.info("Political trades backfill started")
-        trades   = _fetch_political_trades(tickers=_all_tickers(), limit=1000)
+        trades   = _fetch_political_trades(tickers=_all_tickers())
         inserted = _db.upsert_political_trades(trades)
         logger.info("Political trades backfill done — %d fetched, %d new", len(trades), inserted)
     threading.Thread(target=_run, daemon=True).start()
