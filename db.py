@@ -371,6 +371,7 @@ def upsert_political_trades(trades: list) -> int:
                 ticker=t.get("ticker", ""),
                 trade_date=t.get("trade_date", ""),
                 type=t.get("type", ""),
+                amount=t.get("amount", ""),
             ).first()
             if existing:
                 # Backfill sector if we now have it but the row doesn't
