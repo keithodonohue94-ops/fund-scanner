@@ -197,6 +197,9 @@ def init_db():
         "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS ttm_eps FLOAT",
         "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS ntm_eps FLOAT",
         "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS eps_growth_rate FLOAT",
+        # Widen uq_pol_trade to include amount (Sep 2026) — drop old, add new (idempotent via IF NOT EXISTS)
+        "ALTER TABLE political_trades DROP CONSTRAINT IF EXISTS uq_pol_trade",
+        "ALTER TABLE political_trades ADD CONSTRAINT uq_pol_trade UNIQUE (chamber, name, ticker, trade_date, type, amount)",
     ]
     for sql in _migrations:
         try:
@@ -377,6 +380,7 @@ def upsert_political_trades(trades: list) -> int:
                 ticker=t.get("ticker", ""),
                 trade_date=t.get("trade_date", ""),
                 type=t.get("type", ""),
+                amount=t.get("amount", ""),
             ).first()
             if existing:
                 # Backfill sector if we now have it but the row doesn't
