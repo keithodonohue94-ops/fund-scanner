@@ -358,25 +358,31 @@ def get_fundamentals_snapshot(universe: str) -> list:
 # ── Political trades functions ────────────────────────────────────────────────
 
 def upsert_political_trades(trades: list) -> int:
-    """Insert political trade records, ignoring duplicates. Returns new rows inserted."""
+    """Insert political trade records, ignoring duplicates. Returns new rows inserted.
+
+    Duplicate check matches the DB unique constraint uq_pol_trade:
+    (chamber, name, ticker, trade_date, type) — amount is intentionally excluded
+    so that trades with the same key but different amount ranges don't cause
+    UniqueViolation errors.
+    """
     if not trades:
         return 0
-    session = _Session()
     inserted = 0
-    try:
-        for t in trades:
+    for t in trades:
+        session = _Session()
+        try:
             existing = session.query(PoliticalTrade).filter_by(
                 chamber=t.get("chamber", ""),
                 name=t.get("name", ""),
                 ticker=t.get("ticker", ""),
                 trade_date=t.get("trade_date", ""),
                 type=t.get("type", ""),
-                amount=t.get("amount", ""),
             ).first()
             if existing:
                 # Backfill sector if we now have it but the row doesn't
                 if t.get("sector") and not existing.sector:
                     existing.sector = t.get("sector", "")
+                session.commit()
                 continue
             row = PoliticalTrade(
                 chamber    = t.get("chamber", ""),
@@ -394,15 +400,14 @@ def upsert_political_trades(trades: list) -> int:
                 sector     = t.get("sector", ""),
             )
             session.add(row)
+            session.commit()
             inserted += 1
-        session.commit()
-        return inserted
-    except Exception as exc:
-        session.rollback()
-        logger.error("upsert_political_trades error: %s", exc)
-        raise
-    finally:
-        session.close()
+        except Exception as exc:
+            session.rollback()
+            logger.warning("upsert_political_trades skipping duplicate: %s", exc)
+        finally:
+            session.close()
+    return inserted
 
 
 def get_political_trades(tickers: set = None, since_date: str = None, limit: int = 2000) -> list:
