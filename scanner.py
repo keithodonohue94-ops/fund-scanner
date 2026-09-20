@@ -817,10 +817,13 @@ def refresh_last_prices() -> int:
 
 # ── Political trades ──────────────────────────────────────────────────────────
 
-def _fetch_political_trades(tickers: set = None, limit: int = None) -> list:
+def _fetch_political_trades(tickers: set = None, limit: int = None,
+                            from_date: str = None, to_date: str = None) -> list:
     """
     Fetch Senate + House trading disclosures from FMP per-symbol endpoints.
-    tickers: set of uppercase ticker symbols to fetch. If None, returns empty.
+    tickers:   set of uppercase ticker symbols to fetch. If None, returns empty.
+    from_date: optional YYYY-MM-DD — passed to FMP as 'from' to get older records.
+    to_date:   optional YYYY-MM-DD — passed to FMP as 'to'.
     Returns list of normalised dicts sorted by disc_date desc.
     """
     from datetime import datetime as _dt
@@ -837,12 +840,19 @@ def _fetch_political_trades(tickers: set = None, limit: int = None) -> list:
     if not tickers:
         return []
 
+    # Build optional date params — FMP accepts 'from'/'to' on per-ticker endpoints
+    date_params = {}
+    if from_date:
+        date_params["from"] = from_date[:10]
+    if to_date:
+        date_params["to"] = to_date[:10]
+
     seen = set()
     results = []
 
     for ticker in sorted(tickers):
         # Senate trades for this ticker
-        senate_raw = _fmp_get(f"{FMP_STABLE}/senate-trades", {"symbol": ticker}) or []
+        senate_raw = _fmp_get(f"{FMP_STABLE}/senate-trades", {"symbol": ticker, **date_params}) or []
         if isinstance(senate_raw, dict):
             senate_raw = senate_raw.get("data", []) or []
         for row in senate_raw:
@@ -868,7 +878,7 @@ def _fetch_political_trades(tickers: set = None, limit: int = None) -> list:
             })
 
         # House trades for this ticker
-        house_raw = _fmp_get(f"{FMP_STABLE}/house-trades", {"symbol": ticker}) or []
+        house_raw = _fmp_get(f"{FMP_STABLE}/house-trades", {"symbol": ticker, **date_params}) or []
         if isinstance(house_raw, dict):
             house_raw = house_raw.get("data", []) or []
         for row in house_raw:

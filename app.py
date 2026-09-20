@@ -98,7 +98,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -569,7 +569,7 @@ def get_political_trades():
 
 @app.route("/api/political-trades/backfill", methods=["POST"])
 def backfill_political_trades():
-    """POST /api/political-trades/backfill — fetch up to 1000 records, upsert."""
+    """POST /api/political-trades/backfill — fetch recent trades, upsert."""
     def _run():
         logger.info("Political trades backfill started")
         trades   = _fetch_political_trades(tickers=_all_tickers())
@@ -577,6 +577,34 @@ def backfill_political_trades():
         logger.info("Political trades backfill done — %d fetched, %d new", len(trades), inserted)
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "backfill_started"})
+
+
+@app.route("/api/political-trades/backfill-year", methods=["POST"])
+def backfill_political_trades_year():
+    """
+    POST /api/political-trades/backfill-year?year=2024
+    Fetches all trades per-ticker for a specific calendar year using FMP
+    from/to date params, then upserts. Runs in background thread.
+    Use this to fill in historical years (2024, 2025) where FMP's default
+    per-ticker response only returns the most recent page of results.
+    """
+    year = request.args.get("year", "")
+    if not year or not year.isdigit() or len(year) != 4:
+        return jsonify({"error": "year param required (e.g. ?year=2024)"}), 400
+    from_date = f"{year}-01-01"
+    to_date   = f"{year}-12-31"
+
+    def _run():
+        logger.info("Political trades year backfill started — year=%s", year)
+        trades   = _fetch_political_trades(
+            tickers=_all_tickers(),
+            from_date=from_date,
+            to_date=to_date,
+        )
+        inserted = _db.upsert_political_trades(trades)
+        logger.info("Political trades year backfill done — year=%s %d fetched, %d new", year, len(trades), inserted)
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "year_backfill_started", "year": year, "from": from_date, "to": to_date})
 
 
 @app.route("/api/political-trades/backfill-historical", methods=["POST"])
