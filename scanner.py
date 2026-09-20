@@ -690,6 +690,30 @@ def backfill_trade_prices(batch_size: int = 200) -> dict:
         try:
             price = _fmp_historical_close(row["ticker"], row["trade_date"])
             if price:
+                # Sanity check: for recent trades (< 120 days old) the historical
+                # price should be within 60% of the current quote. A ratio outside
+                # that range almost always means FMP returned stale/wrong-date data.
+                from datetime import datetime as _dt2
+                try:
+                    days_ago = (_dt2.utcnow() - _dt2.strptime(row["trade_date"][:10], "%Y-%m-%d")).days
+                    if days_ago < 120:
+                        q = _fmp_get(f"{FMP_STABLE}/quote", {"symbol": row["ticker"].upper()})
+                        cur = None
+                        if isinstance(q, list) and q:
+                            cur = _safe_float(q[0].get("price"))
+                        elif isinstance(q, dict):
+                            cur = _safe_float(q.get("price"))
+                        if cur and cur > 0 and (price / cur > 2.5 or price / cur < 0.25):
+                            logger.warning(
+                                "AT-TRADE price sanity FAIL %s %s: historical=%.2f current=%.2f "
+                                "ratio=%.2f — skipping (likely bad FMP data)",
+                                row["ticker"], row["trade_date"], price, cur, price / cur,
+                            )
+                            errors += 1
+                            _time.sleep(0.12)
+                            continue
+                except Exception:
+                    pass  # sanity check is best-effort; don't block on error
                 updates.append({"id": row["id"], "price_at_trade": price})
             else:
                 errors += 1

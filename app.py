@@ -98,7 +98,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -638,6 +638,36 @@ def backfill_political_trades_forward_prices():
             except: pass
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "forward_price_backfill_started"})
+
+
+@app.route("/api/political-trades/reset-prices", methods=["POST"])
+def reset_trade_prices():
+    """
+    POST /api/political-trades/reset-prices?ticker=NFLX
+    Nulls out price_at_trade and price_last for all trades of a given ticker so
+    the next backfill-prices run re-fetches them from FMP.
+    Use when a stored price looks obviously wrong (bad FMP data, etc.).
+    No auth required — admin/debug endpoint.
+    """
+    ticker = (request.args.get("ticker") or "").upper().strip()
+    if not ticker:
+        return jsonify({"error": "ticker param required"}), 400
+    try:
+        session = _db._Session()
+        rows = session.query(_db.PoliticalTrade).filter_by(ticker=ticker).all()
+        count = 0
+        for r in rows:
+            r.price_at_trade     = None
+            r.price_last         = None
+            r.price_last_updated = None
+            count += 1
+        session.commit()
+        session.close()
+        logger.info("reset-prices: nulled price_at_trade + price_last for %d %s rows", count, ticker)
+        return jsonify({"status": "ok", "ticker": ticker, "rows_reset": count})
+    except Exception as exc:
+        logger.error("reset-prices error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/political-trades/clear")
