@@ -771,18 +771,33 @@ def backfill_political_trade_sectors():
 def backfill_trade_prices_endpoint():
     """
     POST /api/political-trades/backfill-prices
-    Fetches AT-TRADE (EOD close on trade_date) and LAST prices for up to 200 trades
-    that don't have price_at_trade set yet. Safe to call multiple times — only
-    processes rows still missing prices.
+    Fires a background thread that continuously prices batches of trades missing
+    price_at_trade until all are done. Returns immediately so Cloudflare doesn't 524.
+    Safe to call multiple times — only processes rows still missing prices.
     """
-    batch = min(int(request.args.get("batch", 200)), 500)
-    try:
-        result = backfill_trade_prices(batch_size=batch)
-        counts = _db.get_political_trades_count()
-        return jsonify({"status": "ok", **result, **counts})
-    except Exception as exc:
-        logger.error("backfill-prices error: %s", exc)
-        return jsonify({"error": str(exc)}), 500
+    batch = int(request.args.get("batch", 500))
+    def _run():
+        total_filled = 0
+        total_errors = 0
+        run = 0
+        while True:
+            try:
+                result = backfill_trade_prices(batch_size=batch)
+                filled = result.get("filled_at", 0)
+                total_filled += filled
+                total_errors += result.get("errors", 0)
+                run += 1
+                logger.info("backfill-prices run=%d filled=%d total_filled=%d errors=%d",
+                            run, filled, total_filled, total_errors)
+                if filled == 0:
+                    break  # nothing left to price
+            except Exception as exc:
+                logger.error("backfill-prices loop error: %s", exc)
+                break
+        logger.info("backfill-prices complete: total_filled=%d total_errors=%d",
+                    total_filled, total_errors)
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "backfill_prices_started", "batch": batch})
 
 
 @app.route("/api/political-trades/refresh-last-prices", methods=["POST"])
