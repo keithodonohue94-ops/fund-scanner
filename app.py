@@ -98,7 +98,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year", "/api/political-trades/years"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -553,17 +553,30 @@ def get_fundamentals():
 
 @app.route("/api/political-trades")
 def get_political_trades():
-    """GET /api/political-trades?tickers=AAPL,MSFT&limit=2000 — serves from DB."""
+    """GET /api/political-trades?tickers=AAPL,MSFT&limit=2000&trade_year=2024&disc_year=2024 — serves from DB."""
     tickers_raw = request.args.get("tickers", "")
     tickers = set(t.strip().upper() for t in tickers_raw.split(",") if t.strip()) if tickers_raw else None
     limit = min(int(request.args.get("limit", 2000)), 5000)
+    trade_year = request.args.get("trade_year") or None
+    disc_year  = request.args.get("disc_year")  or None
     try:
-        data = _db.get_political_trades(tickers=tickers, limit=limit)
+        data = _db.get_political_trades(tickers=tickers, limit=limit,
+                                        trade_year=trade_year, disc_year=disc_year)
         resp = jsonify({"results": data, "count": len(data)})
         resp.headers['Cache-Control'] = 'public, max-age=86400'
         return resp
     except Exception as exc:
         logger.error("political-trades error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/political-trades/years")
+def get_political_trade_years():
+    """GET /api/political-trades/years — distinct years for trade_date and disc_date."""
+    try:
+        return jsonify(_db.get_political_trade_years())
+    except Exception as exc:
+        logger.error("political-trade-years error: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
 

@@ -414,7 +414,8 @@ def upsert_political_trades(trades: list) -> int:
     return inserted
 
 
-def get_political_trades(tickers: set = None, since_date: str = None, limit: int = 2000) -> list:
+def get_political_trades(tickers: set = None, since_date: str = None, limit: int = 2000,
+                         trade_year: str = None, disc_year: str = None) -> list:
     """Query stored political trades, newest disc_date first."""
     session = _Session()
     try:
@@ -423,8 +424,33 @@ def get_political_trades(tickers: set = None, since_date: str = None, limit: int
             q = q.filter(PoliticalTrade.ticker.in_(tickers))
         if since_date:
             q = q.filter(PoliticalTrade.disc_date >= since_date)
+        if trade_year:
+            q = q.filter(PoliticalTrade.trade_date.like(f"{trade_year}%"))
+        if disc_year:
+            q = q.filter(PoliticalTrade.disc_date.like(f"{disc_year}%"))
         rows = q.limit(limit).all()
         return [_pol_row_to_dict(r) for r in rows]
+    finally:
+        session.close()
+
+
+def get_political_trade_years() -> dict:
+    """Return distinct years present in trade_date and disc_date columns."""
+    from sqlalchemy import text as _text
+    session = _Session()
+    try:
+        trade_rows = session.execute(_text(
+            "SELECT DISTINCT SUBSTRING(trade_date, 1, 4) AS yr FROM political_trades "
+            "WHERE trade_date IS NOT NULL AND trade_date != '' ORDER BY yr DESC"
+        )).fetchall()
+        disc_rows = session.execute(_text(
+            "SELECT DISTINCT SUBSTRING(disc_date, 1, 4) AS yr FROM political_trades "
+            "WHERE disc_date IS NOT NULL AND disc_date != '' ORDER BY yr DESC"
+        )).fetchall()
+        return {
+            "trade_years": [r[0] for r in trade_rows if r[0]],
+            "disc_years":  [r[0] for r in disc_rows  if r[0]],
+        }
     finally:
         session.close()
 
