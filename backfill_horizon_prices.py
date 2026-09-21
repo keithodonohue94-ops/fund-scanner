@@ -2,18 +2,20 @@
 backfill_horizon_prices.py
 ──────────────────────────
 One-time script: for every political trade that has a price_at_trade but is
-missing price_30d / price_60d / price_90d, fetch FMP historical daily closes
-and persist all three horizon prices to the DB.
+missing price_30d / price_60d / price_90d, fetch historical daily closes via
+yfinance and persist all three horizon prices to the DB.
 
-Fetches ONE FMP request per ticker (full range), so ~hundreds of calls total,
-not tens-of-thousands.
+Uses yfinance — free, no API key required, full history available.
+
+Fetches ONE yfinance request per ticker (full range), so ~hundreds of calls
+total, not tens-of-thousands.
 
 Run locally or as a Render one-off job:
+    pip install yfinance
     python backfill_horizon_prices.py
 
 Env vars required:
     DATABASE_URL   — Postgres connection string
-    FMP_API_KEY    — Financial Modelling Prep key
 """
 
 import os
@@ -23,8 +25,6 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-import requests
-
 # ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -32,10 +32,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── env ───────────────────────────────────────────────────────────────────────
-FMP_KEY = os.environ.get("FMP_API_KEY", "")
-if not FMP_KEY:
-    log.error("FMP_API_KEY not set — aborting.")
+# ── yfinance ──────────────────────────────────────────────────────────────────
+try:
+    import yfinance as yf
+except ImportError:
+    log.error("yfinance not installed. Run: pip install yfinance")
     sys.exit(1)
 
 # Import db functions (script lives in same directory as db.py)
@@ -45,10 +46,12 @@ import db as _db
 # ── helpers ───────────────────────────────────────────────────────────────────
 HORIZONS = [30, 60, 90]   # days post trade_date to price
 
+
 def _add_days(date_str: str, n: int) -> str:
     """Return YYYY-MM-DD string n calendar days after date_str."""
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     return (dt + timedelta(days=n)).strftime("%Y-%m-%d")
+
 
 def _find_nearest_close(price_map: dict, target_date: str, max_search: int = 10) -> float | None:
     """
@@ -62,30 +65,31 @@ def _find_nearest_close(price_map: dict, target_date: str, max_search: int = 10)
             return price_map[candidate]
     return None
 
-def fetch_fmp_history(ticker: str, from_date: str, to_date: str) -> dict:
+
+def fetch_yf_history(ticker: str, from_date: str, to_date: str) -> dict:
     """
-    Fetch FMP historical daily closes for ticker between from_date and to_date.
+    Fetch yfinance daily closes for ticker between from_date and to_date.
     Returns {date_str: close_price} or {} on failure.
     """
-    url = (
-        f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}"
-        f"?from={from_date}&to={to_date}&apikey={FMP_KEY}"
-    )
     try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 429:
-            log.warning("FMP rate limit hit — sleeping 60s")
-            time.sleep(60)
-            resp = requests.get(url, timeout=15)
-        if not resp.ok:
-            log.warning("FMP %s → HTTP %s", ticker, resp.status_code)
+        # to_date is exclusive in yfinance, add 1 day buffer
+        to_dt = (datetime.strptime(to_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        t = yf.Ticker(ticker)
+        hist = t.history(start=from_date, end=to_dt, auto_adjust=True)
+        if hist.empty:
+            log.warning("  yfinance returned empty history for %s", ticker)
             return {}
-        data = resp.json()
-        historical = data.get("historical", [])
-        return {row["date"]: row["close"] for row in historical if "date" in row and "close" in row}
+        # Convert index (DatetimeIndex) to YYYY-MM-DD strings
+        price_map = {
+            row.Index.strftime("%Y-%m-%d"): float(row.Close)
+            for row in hist.itertuples()
+            if hasattr(row, "Close") and row.Close is not None
+        }
+        return price_map
     except Exception as exc:
-        log.warning("FMP fetch error for %s: %s", ticker, exc)
+        log.warning("yfinance fetch error for %s: %s", ticker, exc)
         return {}
+
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -101,7 +105,7 @@ def main():
     except Exception as exc:
         log.warning("Migration warning (may already exist): %s", exc)
 
-    # Pull all trades needing horizon prices (batched in chunks of 5000)
+    # Pull all trades needing horizon prices
     log.info("Fetching trades needing horizon prices…")
     trades = _db.get_trades_needing_horizon_prices(limit=100000)
     log.info("Found %d trades to process.", len(trades))
@@ -131,12 +135,13 @@ def main():
         log.info("[%d/%d] %s — %d trades, range %s → %s",
                  idx, len(by_ticker), ticker, len(ticker_trades), from_date, to_date)
 
-        price_map = fetch_fmp_history(ticker, from_date, to_date)
+        price_map = fetch_yf_history(ticker, from_date, to_date)
         if not price_map:
             log.warning("  No price history for %s — skipping", ticker)
             total_errors += len(ticker_trades)
-            time.sleep(0.3)
             continue
+
+        log.info("  Got %d trading days of history for %s", len(price_map), ticker)
 
         updates = []
         for trade in ticker_trades:
@@ -157,8 +162,8 @@ def main():
             total_filled += touched
             log.info("  Updated %d rows for %s", touched, ticker)
 
-        # Polite rate limiting: ~3 req/sec
-        time.sleep(0.35)
+        # Small pause to be polite to Yahoo
+        time.sleep(0.2)
 
     log.info("─" * 60)
     log.info("Backfill complete. filled=%d  errors=%d", total_filled, total_errors)
