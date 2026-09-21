@@ -21,11 +21,19 @@ Outputs a ranked breakdown of every signal dimension:
   - Year-over-year consistency
 """
 
-import os, sys
+import os, sys, argparse
 sys.path.insert(0, os.path.dirname(__file__))
 
 from collections import defaultdict
 from datetime import datetime, timedelta
+
+# ── CLI args ──────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="Congressional trading alpha analysis")
+parser.add_argument("--since", default=None,
+                    help="Filter to trade_date >= YYYY-MM-DD  (e.g. --since 2021-01-01)")
+parser.add_argument("--until", default=None,
+                    help="Filter to trade_date <= YYYY-MM-DD  (e.g. --until 2023-12-31)")
+args = parser.parse_args()
 
 # ── DB connection ─────────────────────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -38,23 +46,33 @@ import sqlalchemy as sa
 engine = sa.create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-print("Loading political_trades from DB…")
+date_label = ""
+where_clauses = ["price_at_trade IS NOT NULL", "price_at_trade > 0"]
+if args.since:
+    where_clauses.append(f"trade_date >= '{args.since}'")
+    date_label += f" since {args.since}"
+if args.until:
+    where_clauses.append(f"trade_date <= '{args.until}'")
+    date_label += f" until {args.until}"
+
+where_sql = " AND ".join(where_clauses)
+
+print(f"Loading political_trades from DB{date_label}…")
 with engine.connect() as conn:
-    rows = conn.execute(sa.text("""
+    rows = conn.execute(sa.text(f"""
         SELECT
             id, chamber, name, party, ticker, type, amount,
             trade_date, disc_date, lag_days, sector,
             price_at_trade, price_last, price_30d, price_60d, price_90d
         FROM political_trades
-        WHERE price_at_trade IS NOT NULL
-          AND price_at_trade > 0
+        WHERE {where_sql}
     """)).fetchall()
 
 cols = ["id","chamber","name","party","ticker","type","amount",
         "trade_date","disc_date","lag_days","sector",
         "price_at_trade","price_last","price_30d","price_60d","price_90d"]
 trades = [dict(zip(cols, r)) for r in rows]
-print(f"Loaded {len(trades):,} trades with price_at_trade")
+print(f"Loaded {len(trades):,} trades with price_at_trade{date_label}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def ret(price_at, price_later):
