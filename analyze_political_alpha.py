@@ -329,6 +329,281 @@ if priced_90:
     sc90 = stats(c90_rets)
     print(f"  Cluster @ 90d: N={sc90['n']:,}  WinRate={sc90['win_rate']:.1f}%  AvgRet={sc90['avg_ret']:+.1f}%")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EXTENDED ANALYSES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def trade_year(t):
+    td = t.get("trade_date") or ""
+    return td[:4] if len(td) >= 4 else "Unknown"
+
+def lag_stats(trade_list):
+    """Avg/median lag and % filed late for a list of trades."""
+    lags = [t["lag_days"] for t in trade_list if t["lag_days"] is not None]
+    if not lags:
+        return None
+    n = len(lags)
+    ls = sorted(lags)
+    avg = sum(lags) / n
+    med = ls[n // 2] if n % 2 == 1 else (ls[n // 2 - 1] + ls[n // 2]) / 2
+    pct_late      = sum(1 for l in lags if l > 45) / n * 100
+    pct_very_late = sum(1 for l in lags if l > 90) / n * 100
+    return dict(n=n, avg=avg, med=med, pct_late=pct_late, pct_very_late=pct_very_late)
+
+SIZE_ORDER = ["$1K–$15K", "$15K–$50K", "$50K–$100K",
+              "$100K–$250K", "$250K–$500K", "$500K–$1M", "$1M+"]
+LAG_ORDER  = ["0–30d", "31–60d", "61–90d", "91–180d", "180d+"]
+
+years_sorted = sorted(
+    {trade_year(t) for t in trades if trade_year(t) != "Unknown"}
+)
+
+# ── 15. DISCLOSURE LAG EVOLUTION BY YEAR ──────────────────────────────────────
+# NOTE: best run without --since/--until to see the full 2014-2026 picture.
+print(f"\n{'='*70}")
+print("  DISCLOSURE LAG EVOLUTION BY YEAR  (all trades with lag_days)")
+print(f"{'='*70}")
+print(f"  {'Year':<6}  {'N':>6}  {'AvgLag':>8}  {'MedLag':>8}  {'>45d%':>7}  {'>90d%':>7}")
+print(f"  {'----':<6}  {'------':>6}  {'------':>8}  {'------':>8}  {'-----':>7}  {'-----':>7}")
+for yr in years_sorted:
+    yr_trades = [t for t in trades if trade_year(t) == yr]
+    ls = lag_stats(yr_trades)
+    if ls and ls["n"] >= 10:
+        print(f"  {yr:<6}  {ls['n']:>6,}  {ls['avg']:>7.1f}d  {ls['med']:>7.1f}d  "
+              f"{ls['pct_late']:>6.1f}%  {ls['pct_very_late']:>6.1f}%")
+
+print(f"\n  Alpha by (year × lag bucket) @ 60d, direction-adjusted, min n=10")
+print(f"  {'Year':<6}  {'LagBucket':<11}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}")
+print(f"  {'----':<6}  {'-'*11}  {'-----':>5}  {'----':>7}  {'------':>8}")
+for yr in years_sorted:
+    yr_priced = [t for t in priced_60 if trade_year(t) == yr]
+    lag_groups = defaultdict(list)
+    for t in yr_priced:
+        r = direction_ret_60(t)
+        if r is not None:
+            lag_groups[lag_bracket(t["lag_days"])].append(r)
+    for lb in LAG_ORDER:
+        if lb in lag_groups and len(lag_groups[lb]) >= 10:
+            s = stats(lag_groups[lb])
+            print(f"  {yr:<6}  {lb:<11}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%")
+
+# ── 16. DISCLOSURE LAG BY CHAMBER × YEAR ──────────────────────────────────────
+print(f"\n{'='*70}")
+print("  DISCLOSURE LAG BY CHAMBER × YEAR")
+print(f"{'='*70}")
+print(f"  {'Year':<6}  {'Chamber':<7}  {'N':>5}  {'AvgLag':>7}  {'MedLag':>7}  "
+      f"{'>45d%':>6}  {'Alpha@60d':>10}")
+print(f"  {'----':<6}  {'-------':<7}  {'-----':>5}  {'------':>7}  {'------':>7}  "
+      f"{'-----':>6}  {'---------':>10}")
+for yr in years_sorted:
+    for chamber in ["Senate", "House"]:
+        subset = [t for t in trades
+                  if trade_year(t) == yr and (t["chamber"] or "") == chamber]
+        ls = lag_stats(subset)
+        if not ls or ls["n"] < 10:
+            continue
+        priced_sub = [t for t in priced_60
+                      if trade_year(t) == yr and (t["chamber"] or "") == chamber]
+        alpha_rets = [r for t in priced_sub
+                      for r in [direction_ret_60(t)] if r is not None]
+        alpha_str = f"{sum(alpha_rets)/len(alpha_rets):>+6.1f}%" if alpha_rets else "     —"
+        print(f"  {yr:<6}  {chamber:<7}  {ls['n']:>5,}  {ls['avg']:>6.1f}d  {ls['med']:>6.1f}d  "
+              f"{ls['pct_late']:>5.1f}%  {alpha_str:>10}")
+
+# ── 17. DISCLOSURE LAG BY POSITION SIZE ───────────────────────────────────────
+print(f"\n{'='*70}")
+print("  DISCLOSURE LAG BY POSITION SIZE")
+print(f"{'='*70}")
+
+print(f"\n  Filing speed by position size bracket (all trades with lag_days):")
+print(f"  {'SizeBracket':<16}  {'N':>6}  {'AvgLag':>7}  {'MedLag':>7}  {'>45d%':>6}  {'>90d%':>6}")
+print(f"  {'-'*16}  {'------':>6}  {'------':>7}  {'------':>7}  {'-----':>6}  {'-----':>6}")
+for sz in SIZE_ORDER:
+    subset = [t for t in trades if amount_bracket(t["amount"]) == sz]
+    ls = lag_stats(subset)
+    if ls and ls["n"] >= 10:
+        print(f"  {sz:<16}  {ls['n']:>6,}  {ls['avg']:>6.1f}d  {ls['med']:>6.1f}d  "
+              f"{ls['pct_late']:>5.1f}%  {ls['pct_very_late']:>5.1f}%")
+
+print(f"\n  Alpha by (position size × lag bucket) @ 60d, direction-adjusted, min n=10:")
+print(f"  {'SizeBracket':<16}  {'LagBucket':<11}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}")
+print(f"  {'-'*16}  {'-'*11}  {'-----':>5}  {'----':>7}  {'------':>8}")
+for sz in SIZE_ORDER:
+    for lb in LAG_ORDER:
+        subset = [t for t in priced_60
+                  if amount_bracket(t["amount"]) == sz
+                  and lag_bracket(t["lag_days"]) == lb]
+        rets = [r for t in subset for r in [direction_ret_60(t)] if r is not None]
+        if len(rets) >= 10:
+            s = stats(rets)
+            print(f"  {sz:<16}  {lb:<11}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%")
+
+# ── 18. CLUSTER TRADES × POSITION SIZE ────────────────────────────────────────
+print(f"\n{'='*70}")
+print("  CLUSTER TRADES × POSITION SIZE  @ 60d & 90d")
+print("  (≥2 politicians same ticker within 7 days)")
+print(f"{'='*70}")
+
+print(f"\n  All cluster buys by position size @ 60d (min n=5):")
+print(f"  {'SizeBracket':<16}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}  {'MedRet':>8}")
+print(f"  {'-'*16}  {'-----':>5}  {'----':>7}  {'------':>8}  {'------':>8}")
+for sz in SIZE_ORDER:
+    subset = [t for t in cluster_trades if amount_bracket(t["amount"]) == sz]
+    rets = [r for t in subset
+            for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    if len(rets) >= 5:
+        s = stats(rets)
+        print(f"  {sz:<16}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%  {s['med_ret']:>+7.1f}%")
+
+BIG_SIZE_BUCKETS = ("$100K–$250K", "$250K–$500K", "$500K–$1M", "$1M+")
+big_cluster_100  = [t for t in cluster_trades
+                    if amount_bracket(t["amount"]) in BIG_SIZE_BUCKETS]
+bc100_rets = [r for t in big_cluster_100
+              for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+if bc100_rets:
+    s = stats(bc100_rets)
+    print(f"\n  Cluster buys ≥$100K combined @ 60d:")
+    print(f"  N={s['n']:,}  Win%={s['win_rate']:.1f}%  AvgRet={s['avg_ret']:+.1f}%  MedRet={s['med_ret']:+.1f}%")
+
+cluster_90_all = [t for t in cluster_trades if t["price_90d"] is not None]
+
+print(f"\n  All cluster buys by position size @ 90d (min n=5):")
+print(f"  {'SizeBracket':<16}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}  {'MedRet':>8}")
+print(f"  {'-'*16}  {'-----':>5}  {'----':>7}  {'------':>8}  {'------':>8}")
+for sz in SIZE_ORDER:
+    subset = [t for t in cluster_90_all if amount_bracket(t["amount"]) == sz]
+    rets = [r for t in subset
+            for r in [ret(t["price_at_trade"], t["price_90d"])] if r is not None]
+    if len(rets) >= 5:
+        s = stats(rets)
+        print(f"  {sz:<16}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%  {s['med_ret']:>+7.1f}%")
+
+big_cluster_100_90 = [t for t in cluster_90_all
+                      if amount_bracket(t["amount"]) in BIG_SIZE_BUCKETS]
+bc100_90_rets = [r for t in big_cluster_100_90
+                 for r in [ret(t["price_at_trade"], t["price_90d"])] if r is not None]
+if bc100_90_rets:
+    s = stats(bc100_90_rets)
+    print(f"\n  Cluster buys ≥$100K combined @ 90d:")
+    print(f"  N={s['n']:,}  Win%={s['win_rate']:.1f}%  AvgRet={s['avg_ret']:+.1f}%  MedRet={s['med_ret']:+.1f}%")
+
+# ── 19. REPEAT BUYER ALPHA ────────────────────────────────────────────────────
+# Same politician buys same ticker again within 30 days of a prior purchase.
+print(f"\n{'='*70}")
+print("  REPEAT BUYER ALPHA  @ 60d & 90d")
+print("  (politician buys ticker X, then buys X again within 30 days)")
+print(f"{'='*70}")
+
+all_buys_rb = [t for t in trades if is_buy(t) and t["trade_date"]]
+all_buys_rb.sort(key=lambda t: (t["name"] or "", t["ticker"] or "", t["trade_date"]))
+
+by_name_ticker = defaultdict(list)
+for t in all_buys_rb:
+    by_name_ticker[(t["name"], t["ticker"])].append(t)
+
+repeat_initial  = []   # first buy in a within-30d pair
+repeat_followon = []   # the follow-on buy
+solo_buys_rb    = []   # buys with no repeat partner
+
+for (name, ticker), tbuy in by_name_ticker.items():
+    tbuy.sort(key=lambda t: t["trade_date"])
+    n_t = len(tbuy)
+    is_repeat = [False] * n_t
+
+    for i in range(n_t):
+        d_i = datetime.strptime(tbuy[i]["trade_date"], "%Y-%m-%d")
+        for j in range(i + 1, n_t):
+            d_j = datetime.strptime(tbuy[j]["trade_date"], "%Y-%m-%d")
+            if (d_j - d_i).days <= 30:
+                is_repeat[i] = True
+                is_repeat[j] = True
+            else:
+                break   # sorted, so no further j qualifies for this i
+
+    for i, t in enumerate(tbuy):
+        if not is_repeat[i]:
+            solo_buys_rb.append(t)
+            continue
+        # determine if this trade is preceded by another repeat buy
+        d_i = datetime.strptime(t["trade_date"], "%Y-%m-%d")
+        preceded = any(
+            0 < (d_i - datetime.strptime(tbuy[j]["trade_date"], "%Y-%m-%d")).days <= 30
+            for j in range(i)
+        )
+        if preceded:
+            repeat_followon.append(t)
+        else:
+            repeat_initial.append(t)
+
+def group_alpha_60_90(trade_list):
+    r60 = [r for t in trade_list
+           for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    r90 = [r for t in trade_list
+           for r in [ret(t["price_at_trade"], t["price_90d"])] if r is not None]
+    return stats(r60), stats(r90)
+
+ri_60,  ri_90  = group_alpha_60_90(repeat_initial)
+rf_60,  rf_90  = group_alpha_60_90(repeat_followon)
+so_60,  so_90  = group_alpha_60_90(solo_buys_rb)
+
+# Combined repeat (initial + followon together)
+combined_repeat = repeat_initial + repeat_followon
+rc_60, rc_90 = group_alpha_60_90(combined_repeat)
+
+print(f"\n  {'Group':<28}  {'N':>6}  {'Win%@60d':>9}  {'Ret@60d':>8}  "
+      f"{'Win%@90d':>9}  {'Ret@90d':>8}")
+print(f"  {'-'*28}  {'------':>6}  {'-'*9}  {'-'*8}  {'-'*9}  {'-'*8}")
+for label, s60, s90 in [
+    ("Initial conviction buy",  ri_60, ri_90),
+    ("Follow-on buy (add)",     rf_60, rf_90),
+    ("All repeat buys combined",rc_60, rc_90),
+    ("Solo buy (baseline)",     so_60, so_90),
+]:
+    def fmt(s, key):
+        return f"{s[key]:>+.1f}%" if s["n"] else "—"
+    w60 = f"{s60['win_rate']:.1f}%" if s60["n"] else "—"
+    w90 = f"{s90['win_rate']:.1f}%" if s90["n"] else "—"
+    print(f"  {label:<28}  {s60['n']:>6,}  {w60:>9}  {fmt(s60,'avg_ret'):>8}  "
+          f"{w90:>9}  {fmt(s90,'avg_ret'):>8}")
+
+print(f"\n  Repeat buy alpha by position size — initial vs follow-on vs solo @ 60d (min n=5):")
+print(f"  {'SizeBracket':<16}  {'Group':<10}  {'N':>5}  {'Win%':>7}  {'Ret@60d':>8}  {'Ret@90d':>8}")
+print(f"  {'-'*16}  {'-'*10}  {'-----':>5}  {'----':>7}  {'------':>8}  {'------':>8}")
+for sz in SIZE_ORDER:
+    any_printed = False
+    for label, trade_list in [
+        ("Initial",  repeat_initial),
+        ("Follow-on", repeat_followon),
+        ("Solo",      solo_buys_rb),
+    ]:
+        sub = [t for t in trade_list if amount_bracket(t["amount"]) == sz]
+        r60 = [r for t in sub for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+        r90 = [r for t in sub for r in [ret(t["price_at_trade"], t["price_90d"])] if r is not None]
+        if len(r60) < 5:
+            continue
+        s60 = stats(r60)
+        s90 = stats(r90)
+        ret90_str = f"{s90['avg_ret']:>+7.1f}%" if s90["n"] else "     —"
+        print(f"  {sz:<16}  {label:<10}  {s60['n']:>5,}  {s60['win_rate']:>6.1f}%  "
+              f"{s60['avg_ret']:>+7.1f}%  {ret90_str:>8}")
+        any_printed = True
+    if any_printed:
+        print()
+
+print(f"\n  Politicians with most repeat-buy events (initial buys, min n=5, by win rate):")
+print(f"  {'Politician':<30}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}")
+print(f"  {'-'*30}  {'-----':>5}  {'----':>7}  {'------':>8}")
+pol_rep = defaultdict(list)
+for t in repeat_initial:
+    r = ret(t["price_at_trade"], t["price_60d"])
+    if r is not None:
+        pol_rep[t["name"] or "Unknown"].append(r)
+pol_rep_stats = [(nm, stats(v)) for nm, v in pol_rep.items() if len(v) >= 5]
+pol_rep_stats.sort(key=lambda x: x[1]["win_rate"], reverse=True)
+for nm, s in pol_rep_stats[:15]:
+    print(f"  {nm:<30}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%")
+
 print(f"\n{'='*70}")
 print("  ANALYSIS COMPLETE")
 print(f"{'='*70}\n")
