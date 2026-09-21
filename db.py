@@ -109,6 +109,7 @@ class PoliticalTrade(Base):
     price_last_updated = Column(DateTime)               # When price_last was fetched
     price_30d          = Column(Float)                  # EOD close ~30 days after trade_date
     price_60d          = Column(Float)                  # EOD close ~60 days after trade_date
+    price_90d          = Column(Float)                  # EOD close ~90 days after trade_date
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -811,6 +812,70 @@ def bulk_update_trade_prices(updates: list) -> int:
     except Exception as exc:
         session.rollback()
         logger.error("bulk_update_trade_prices error: %s", exc)
+        raise
+    finally:
+        session.close()
+
+
+def get_trades_needing_horizon_prices(limit: int = 5000) -> list:
+    """Return trades that have price_at_trade but are missing any horizon price."""
+    session = _Session()
+    try:
+        from sqlalchemy import or_
+        rows = (
+            session.query(
+                PoliticalTrade.id,
+                PoliticalTrade.ticker,
+                PoliticalTrade.trade_date,
+                PoliticalTrade.type,
+            )
+            .filter(PoliticalTrade.price_at_trade.isnot(None))
+            .filter(PoliticalTrade.trade_date.isnot(None))
+            .filter(
+                or_(
+                    PoliticalTrade.price_30d.is_(None),
+                    PoliticalTrade.price_60d.is_(None),
+                    PoliticalTrade.price_90d.is_(None),
+                )
+            )
+            .limit(limit)
+            .all()
+        )
+        return [{"id": r[0], "ticker": r[1], "trade_date": r[2], "type": r[3]} for r in rows]
+    finally:
+        session.close()
+
+
+def bulk_update_horizon_prices(updates: list) -> int:
+    """
+    Batch-update price_30d / price_60d / price_90d on PoliticalTrade rows.
+    updates: list of {id, price_30d?, price_60d?, price_90d?}
+    Returns number of rows touched.
+    """
+    if not updates:
+        return 0
+    session = _Session()
+    touched = 0
+    try:
+        for u in updates:
+            trade_id = u.get("id")
+            if not trade_id:
+                continue
+            row = session.query(PoliticalTrade).filter_by(id=trade_id).first()
+            if not row:
+                continue
+            if u.get("price_30d") is not None:
+                row.price_30d = u["price_30d"]
+            if u.get("price_60d") is not None:
+                row.price_60d = u["price_60d"]
+            if u.get("price_90d") is not None:
+                row.price_90d = u["price_90d"]
+            touched += 1
+        session.commit()
+        return touched
+    except Exception as exc:
+        session.rollback()
+        logger.error("bulk_update_horizon_prices error: %s", exc)
         raise
     finally:
         session.close()
