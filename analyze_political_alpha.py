@@ -611,10 +611,11 @@ for nm, s in pol_rep_stats[:15]:
 
 # ── Era definitions ──────────────────────────────────────────────────────────
 ERAS = [
-    ("ALL TIME",   None,       None),
+    ("2014–today", None,        None),
     ("2014–2020",  "2014-01-01","2020-12-31"),
-    ("2021–2024",  "2021-01-01","2024-12-31"),
-    ("2025–2026",  "2025-01-01","2099-12-31"),
+    ("2020–2022",  "2020-01-01","2022-12-31"),
+    ("2021–2025",  "2021-01-01","2025-12-31"),
+    ("2025–today", "2025-01-01", None),
 ]
 
 def era_filter(trade_list, since, until):
@@ -968,9 +969,9 @@ for ticker, ticker_sells in by_ticker_sells.items():
 
 def _sell_adj_rets(trade_list, horizon="60d"):
     key = "price_60d" if horizon == "60d" else "price_90d"
-    return [r for t in trade_list
-            for r in [-ret(t["price_at_trade"], t[key])]   # invert: sell wins if price fell
-            if ret(t["price_at_trade"], t[key]) is not None]
+    return [-r for t in trade_list
+            for r in [ret(t["price_at_trade"], t[key])]
+            if r is not None]
 
 cs_rets  = _sell_adj_rets(cluster_sells,     "60d")
 ncs_rets = _sell_adj_rets(non_cluster_sells, "60d")
