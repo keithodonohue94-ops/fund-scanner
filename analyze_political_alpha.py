@@ -604,6 +604,608 @@ pol_rep_stats.sort(key=lambda x: x[1]["win_rate"], reverse=True)
 for nm, s in pol_rep_stats[:15]:
     print(f"  {nm:<30}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PART B — ERA ANALYSIS + 30d HORIZON + FIRST-MOVER + LEADERBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Era definitions ──────────────────────────────────────────────────────────
+ERAS = [
+    ("ALL TIME",   None,       None),
+    ("2014–2020",  "2014-01-01","2020-12-31"),
+    ("2021–2024",  "2021-01-01","2024-12-31"),
+    ("2025–2026",  "2025-01-01","2099-12-31"),
+]
+
+def era_filter(trade_list, since, until):
+    out = []
+    for t in trade_list:
+        td = t.get("trade_date") or ""
+        if since and td < since: continue
+        if until and td > until: continue
+        out.append(t)
+    return out
+
+# ── 30d return helper (direction-adjusted) ────────────────────────────────────
+def direction_ret_30(t):
+    r = ret(t["price_at_trade"], t["price_30d"])
+    if r is None: return None
+    if is_sell(t): return -r
+    return r
+
+# ── Build all three horizons at once ─────────────────────────────────────────
+def tri_stats(trade_list):
+    r30 = [r for t in trade_list for r in [direction_ret_30(t)] if r is not None]
+    r60 = [r for t in trade_list for r in [direction_ret_60(t)] if r is not None]
+    r90 = [r for t in trade_list for r in [direction_ret_90(t)] if r is not None]
+    return stats(r30), stats(r60), stats(r90)
+
+def fmt_s(s):
+    if not s["n"]:
+        return f"{'—':>6}  {'—':>7}  {'—':>7}"
+    return (f"{s['n']:>6,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+6.1f}%")
+
+# ── 20. ERA × KEY DIMENSIONS ──────────────────────────────────────────────────
+DIMENSION_SPECS = [
+    ("Chamber",           lambda t: t["chamber"] or "Unknown",                      10),
+    ("Chamber×Type",      lambda t: f"{t['chamber'] or '?'} {'BUY' if is_buy(t) else 'SELL'}", 10),
+    ("Party",             lambda t: (t["party"] or "Unknown").strip(),               10),
+    ("PositionSize",      lambda t: amount_bracket(t["amount"]),                     10),
+    ("DisclosureLag",     lambda t: lag_bracket(t["lag_days"]),                      10),
+    ("Sector",            lambda t: t["sector"] or "Unknown",                        15),
+]
+
+print(f"\n{'='*70}")
+print("  ERA ANALYSIS — KEY SIGNALS ACROSS TIME PERIODS")
+print(f"{'='*70}")
+print("  Compares 2014–2020 vs 2021–2024 vs 2025–2026 to spot signal drift.")
+print("  Columns: N | Win% | AvgRet  (direction-adjusted, 60d horizon)")
+print()
+
+for dim_name, key_fn, min_n in DIMENSION_SPECS:
+    print(f"\n  ── {dim_name} ──")
+    # Collect all unique group keys across all data
+    all_keys = sorted({key_fn(t) for t in priced_60})
+    hdr = f"  {'Group':<30}"
+    for era_label, since, until in ERAS:
+        hdr += f"  {era_label:^22}"
+    print(hdr)
+    sub_hdr = f"  {'':<30}"
+    for _ in ERAS:
+        sub_hdr += f"  {'N':>6}  {'Win%':>6}  {'Ret':>6} "
+    print(sub_hdr)
+    print("  " + "-"*30 + ("  " + "-"*22) * len(ERAS))
+
+    for key in all_keys:
+        row = f"  {key:<30}"
+        any_data = False
+        for era_label, since, until in ERAS:
+            era_data = era_filter(priced_60, since, until)
+            subset = [t for t in era_data if key_fn(t) == key]
+            rets = [r for t in subset for r in [direction_ret_60(t)] if r is not None]
+            if len(rets) >= min_n:
+                s = stats(rets)
+                row += f"  {s['n']:>6,}  {s['win_rate']:>5.1f}%  {s['avg_ret']:>+5.1f}% "
+                any_data = True
+            else:
+                row += f"  {'—':>6}  {'—':>6}  {'—':>6} "
+        if any_data:
+            print(row)
+
+# ── 21. ERA × POSITION SIZE × CHAMBER ────────────────────────────────────────
+print(f"\n{'='*70}")
+print("  ERA × POSITION SIZE × CHAMBER  @ 60d (min n=10)")
+print(f"{'='*70}")
+print(f"\n  {'SizeBracket':<16}  {'Chamber':<8}", end="")
+for era_label, _, _ in ERAS:
+    print(f"  {era_label:^22}", end="")
+print()
+print(f"  {'-'*16}  {'-'*8}", end="")
+for _ in ERAS:
+    print(f"  {'N':>6}  {'Win%':>6}  {'Ret':>6} ", end="")
+print()
+
+for sz in SIZE_ORDER:
+    for chamber in ["Senate", "House"]:
+        row = f"  {sz:<16}  {chamber:<8}"
+        any_data = False
+        for era_label, since, until in ERAS:
+            era_data = era_filter(priced_60, since, until)
+            subset = [t for t in era_data
+                      if amount_bracket(t["amount"]) == sz
+                      and (t["chamber"] or "") == chamber]
+            rets = [r for t in subset for r in [direction_ret_60(t)] if r is not None]
+            if len(rets) >= 10:
+                s = stats(rets)
+                row += f"  {s['n']:>6,}  {s['win_rate']:>5.1f}%  {s['avg_ret']:>+5.1f}% "
+                any_data = True
+            else:
+                row += f"  {'—':>6}  {'—':>6}  {'—':>6} "
+        if any_data:
+            print(row)
+
+# ── 22. ERA × CLUSTER ANALYSIS ────────────────────────────────────────────────
+print(f"\n{'='*70}")
+print("  ERA × CLUSTER TRADE ALPHA  @ 60d")
+print(f"{'='*70}")
+
+# Pre-segment cluster_trades and non_cluster_trades by era
+for era_label, since, until in ERAS:
+    ct_era  = era_filter(cluster_trades, since, until)
+    nct_era = era_filter(non_cluster_trades, since, until)
+    cr  = [r for t in ct_era  for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    ncr = [r for t in nct_era for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    sc  = stats(cr)
+    snc = stats(ncr)
+    print(f"\n  {era_label}:")
+    if sc["n"]:
+        print(f"    Cluster buys    : N={sc['n']:,}  Win%={sc['win_rate']:.1f}%  AvgRet={sc['avg_ret']:+.1f}%")
+    else:
+        print(f"    Cluster buys    : —")
+    if snc["n"]:
+        print(f"    Non-cluster buys: N={snc['n']:,}  Win%={snc['win_rate']:.1f}%  AvgRet={snc['avg_ret']:+.1f}%")
+    else:
+        print(f"    Non-cluster buys: —")
+    if sc["n"] and snc["n"]:
+        edge = sc["avg_ret"] - snc["avg_ret"]
+        print(f"    Cluster edge    : {edge:+.1f}% avg return advantage")
+
+# ── 23. FIRST-MOVER vs FOLLOW-ON IN CLUSTERS ─────────────────────────────────
+print(f"\n{'='*70}")
+print("  FIRST-MOVER vs FOLLOW-ON IN CLUSTER WINDOWS  @ 60d & 90d")
+print("  (first politician to buy a ticker that later becomes a cluster)")
+print(f"{'='*70}")
+
+# For each cluster buy, tag it as first-mover (earliest trade_date in the cluster window)
+# or follow-on (any subsequent buy within 7 days of the earliest)
+first_mover_trades = []
+followon_trades    = []
+
+for ticker, ticker_buys in by_ticker_buys.items():
+    ticker_buys_sorted = sorted(ticker_buys, key=lambda t: t["trade_date"])
+    # sliding 7-day windows: find the first trade of each cluster event
+    assigned = set()
+    for i, anchor in enumerate(ticker_buys_sorted):
+        if anchor["id"] in assigned:
+            continue
+        anchor_date = datetime.strptime(anchor["trade_date"], "%Y-%m-%d")
+        # gather all buys within 7 days of anchor by different politicians
+        window = [o for o in ticker_buys_sorted
+                  if o["name"] != anchor["name"]
+                  and 0 <= (datetime.strptime(o["trade_date"], "%Y-%m-%d") - anchor_date).days <= 7]
+        if window:
+            # anchor is a first-mover
+            first_mover_trades.append(anchor)
+            assigned.add(anchor["id"])
+            for o in window:
+                if o["id"] not in assigned:
+                    followon_trades.append(o)
+                    assigned.add(o["id"])
+
+fm_rets_60 = [r for t in first_mover_trades for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+fo_rets_60 = [r for t in followon_trades    for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+fm_rets_90 = [r for t in first_mover_trades for r in [ret(t["price_at_trade"], t["price_90d"])] if r is not None]
+fo_rets_90 = [r for t in followon_trades    for r in [ret(t["price_at_trade"], t["price_90d"])] if r is not None]
+sfm60 = stats(fm_rets_60); sfo60 = stats(fo_rets_60)
+sfm90 = stats(fm_rets_90); sfo90 = stats(fo_rets_90)
+
+print(f"\n  {'Group':<28}  {'N@60d':>6}  {'Win%@60d':>9}  {'Ret@60d':>8}  {'N@90d':>6}  {'Win%@90d':>9}  {'Ret@90d':>8}")
+print(f"  {'-'*28}  {'------':>6}  {'-'*9}  {'-'*8}  {'------':>6}  {'-'*9}  {'-'*8}")
+for label, s60, s90 in [
+    ("First-mover (triggering buy)", sfm60, sfm90),
+    ("Follow-on  (pile-in buy)",     sfo60, sfo90),
+]:
+    w60 = f"{s60['win_rate']:.1f}%" if s60["n"] else "—"
+    w90 = f"{s90['win_rate']:.1f}%" if s90["n"] else "—"
+    r60 = f"{s60['avg_ret']:>+.1f}%" if s60["n"] else "—"
+    r90 = f"{s90['avg_ret']:>+.1f}%" if s90["n"] else "—"
+    print(f"  {label:<28}  {s60['n']:>6,}  {w60:>9}  {r60:>8}  {s90['n']:>6,}  {w90:>9}  {r90:>8}")
+
+# Era breakdown for first-mover
+print(f"\n  First-mover alpha by era @ 60d:")
+for era_label, since, until in ERAS:
+    fm_era = era_filter(first_mover_trades, since, until)
+    rets = [r for t in fm_era for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    if rets:
+        s = stats(rets)
+        print(f"    {era_label:<12}: N={s['n']:,}  Win%={s['win_rate']:.1f}%  AvgRet={s['avg_ret']:+.1f}%")
+
+# ── 24. 30d / 60d / 90d HORIZON COMPARISON ────────────────────────────────────
+print(f"\n{'='*70}")
+print("  HORIZON COMPARISON — does alpha peak at 30d, 60d, or 90d?")
+print(f"{'='*70}")
+print(f"\n  {'Dimension':<30}  {'30d Win%':>9}  {'30d Ret':>8}  {'60d Win%':>9}  {'60d Ret':>8}  {'90d Win%':>9}  {'90d Ret':>8}")
+print(f"  {'-'*30}  {'-'*9}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*9}  {'-'*8}")
+
+def horizon_row(label, trade_list):
+    s30, s60, s90 = tri_stats(trade_list)
+    def fmt(s):
+        if not s["n"]: return f"{'—':>9}  {'—':>8}"
+        return f"{s['win_rate']:>8.1f}%  {s['avg_ret']:>+7.1f}%"
+    print(f"  {label:<30}  {fmt(s30)}  {fmt(s60)}  {fmt(s90)}")
+
+horizon_row("ALL (direction-adjusted)",    priced_60)
+horizon_row("Buys only",                   [t for t in priced_60 if is_buy(t)])
+horizon_row("Sells only (adj)",            [t for t in priced_60 if is_sell(t)])
+horizon_row("Senate",                      [t for t in priced_60 if (t["chamber"] or "") == "Senate"])
+horizon_row("House",                       [t for t in priced_60 if (t["chamber"] or "") == "House"])
+horizon_row("Senate Buys",                 [t for t in priced_60 if (t["chamber"] or "") == "Senate" and is_buy(t)])
+horizon_row("House Buys",                  [t for t in priced_60 if (t["chamber"] or "") == "House" and is_buy(t)])
+horizon_row("Cluster buys",                cluster_trades)
+horizon_row("First-mover buys",            first_mover_trades)
+horizon_row("Follow-on buys",              followon_trades)
+horizon_row("Repeat buys (≤30d)",          repeat_initial + repeat_followon)
+horizon_row("Size ≥$100K (all)",           [t for t in priced_60 if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")])
+horizon_row("Cluster + ≥$100K",            [t for t in cluster_trades if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")])
+horizon_row("First-mover + ≥$100K",       [t for t in first_mover_trades if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")])
+
+# ── 25. POLITICIAN ERA TRENDS ──────────────────────────────────────────────────
+print(f"\n{'='*70}")
+print("  POLITICIAN ERA TRENDS  @ 60d  (top traders per era, min 10 priced trades)")
+print(f"{'='*70}")
+
+for era_label, since, until in ERAS[1:]:   # skip ALL TIME; too much noise
+    era_data = era_filter(priced_60, since, until)
+    pol_groups = defaultdict(list)
+    for t in era_data:
+        r = direction_ret_60(t)
+        if r is not None:
+            pol_groups[t["name"] or "Unknown"].append(r)
+    ranked = [(nm, stats(v)) for nm, v in pol_groups.items() if len(v) >= 10]
+    ranked.sort(key=lambda x: x[1]["avg_ret"], reverse=True)
+    print(f"\n  {era_label} — top 10 by avg return @ 60d:")
+    print(f"  {'Politician':<30}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}  {'MedRet':>8}")
+    print(f"  {'-'*30}  {'-----':>5}  {'----':>7}  {'------':>8}  {'------':>8}")
+    for nm, s in ranked[:10]:
+        print(f"  {nm:<30}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%  {s['med_ret']:>+7.1f}%")
+
+# ── 26. SIGNAL LEADERBOARD ────────────────────────────────────────────────────
+# Composite score = win_rate * log(1 + avg_ret) capped to 100 range
+# Higher = better quality signal
+print(f"\n{'='*70}")
+print("  SIGNAL LEADERBOARD — COMPOSITE SCORE  @ 60d, direction-adjusted")
+print("  Score = win_rate% × (1 + avg_return%) / 100   (min n=20)")
+print(f"{'='*70}")
+
+import math
+
+def composite(s):
+    if not s["n"] or s["win_rate"] is None or s["avg_ret"] is None:
+        return -999
+    return s["win_rate"] * (1 + s["avg_ret"] / 100)
+
+leaderboard = []
+
+def add_signal(label, trade_list, era="ALL"):
+    rets = [r for t in trade_list for r in [direction_ret_60(t)] if r is not None]
+    if len(rets) < 20:
+        return
+    s = stats(rets)
+    leaderboard.append((label, era, s, composite(s)))
+
+# Prime the leaderboard with every signal we've computed
+for era_label, since, until in ERAS:
+    era_p60 = era_filter(priced_60, since, until)
+    era_ct  = era_filter(cluster_trades, since, until)
+    era_fm  = era_filter(first_mover_trades, since, until)
+    era_fo  = era_filter(followon_trades, since, until)
+    era_ri  = era_filter(repeat_initial, since, until)
+    era_rf  = era_filter(repeat_followon, since, until)
+
+    add_signal("All trades",                    era_p60, era_label)
+    add_signal("Buys",                          [t for t in era_p60 if is_buy(t)], era_label)
+    add_signal("Sells (adj)",                   [t for t in era_p60 if is_sell(t)], era_label)
+    add_signal("Senate",                        [t for t in era_p60 if (t["chamber"] or "") == "Senate"], era_label)
+    add_signal("House",                         [t for t in era_p60 if (t["chamber"] or "") == "House"], era_label)
+    add_signal("Senate Buys",                   [t for t in era_p60 if (t["chamber"] or "") == "Senate" and is_buy(t)], era_label)
+    add_signal("House Buys",                    [t for t in era_p60 if (t["chamber"] or "") == "House" and is_buy(t)], era_label)
+    add_signal("Cluster buys",                  era_ct, era_label)
+    add_signal("First-mover buys",              era_fm, era_label)
+    add_signal("Follow-on buys",                era_fo, era_label)
+    add_signal("Repeat buys",                   era_ri + era_rf, era_label)
+    add_signal("Size ≥$100K",                   [t for t in era_p60 if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")], era_label)
+    add_signal("Cluster + ≥$100K",              [t for t in era_ct if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")], era_label)
+    add_signal("First-mover + ≥$100K",         [t for t in era_fm if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")], era_label)
+    add_signal("Senate Cluster buys",           [t for t in era_ct if (t["chamber"] or "") == "Senate"], era_label)
+    add_signal("House Cluster buys",            [t for t in era_ct if (t["chamber"] or "") == "House"], era_label)
+    add_signal("Lag 0–30d",                     [t for t in era_p60 if lag_bracket(t["lag_days"]) == "0–30d"], era_label)
+    add_signal("Lag 0–30d + Cluster",           [t for t in era_ct if lag_bracket(t["lag_days"]) == "0–30d"], era_label)
+    # By sector (top sectors)
+    for sector in ["Technology", "Healthcare", "Financials", "Energy", "Industrials", "Consumer Discretionary"]:
+        sub = [t for t in era_p60 if (t["sector"] or "") == sector]
+        add_signal(f"Sector: {sector}", sub, era_label)
+        sub_buy = [t for t in sub if is_buy(t)]
+        add_signal(f"Sector: {sector} Buys", sub_buy, era_label)
+
+leaderboard.sort(key=lambda x: x[3], reverse=True)
+
+print(f"\n  TOP 30 SIGNAL + ERA COMBINATIONS  (composite score)")
+print(f"  {'Signal':<30}  {'Era':<12}  {'N':>6}  {'Win%':>8}  {'AvgRet':>8}  {'Score':>7}")
+print(f"  {'-'*30}  {'-'*12}  {'------':>6}  {'------':>8}  {'------':>8}  {'-----':>7}")
+for label, era, s, score in leaderboard[:30]:
+    print(f"  {label:<30}  {era:<12}  {s['n']:>6,}  {s['win_rate']:>7.1f}%  {s['avg_ret']:>+7.1f}%  {score:>7.2f}")
+
+# Bottom 10 (worst signals)
+print(f"\n  BOTTOM 10 SIGNALS (worst composite score):")
+print(f"  {'Signal':<30}  {'Era':<12}  {'N':>6}  {'Win%':>8}  {'AvgRet':>8}  {'Score':>7}")
+print(f"  {'-'*30}  {'-'*12}  {'------':>6}  {'------':>8}  {'------':>8}  {'-----':>7}")
+worst = [x for x in leaderboard if x[2]["n"] >= 20]
+worst.sort(key=lambda x: x[3])
+for label, era, s, score in worst[:10]:
+    print(f"  {label:<30}  {era:<12}  {s['n']:>6,}  {s['win_rate']:>7.1f}%  {s['avg_ret']:>+7.1f}%  {score:>7.2f}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PART C — CLUSTER SELLS + 7-DAY SUCCESSIVE TRADES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── 27. CLUSTER SELLS ─────────────────────────────────────────────────────────
+# Cluster sell = ≥2 different politicians SELL the same ticker within 7 days
+print(f"\n{'='*70}")
+print("  CLUSTER SELL ANALYSIS  @ 60d & 90d")
+print("  (≥2 different politicians sell same ticker within 7 calendar days)")
+print(f"{'='*70}")
+
+sells_all = [t for t in priced_60 if is_sell(t) and t["trade_date"]]
+by_ticker_sells = defaultdict(list)
+for t in sells_all:
+    by_ticker_sells[t["ticker"]].append(t)
+
+cluster_sells     = []
+non_cluster_sells = []
+
+for ticker, ticker_sells in by_ticker_sells.items():
+    ticker_sells.sort(key=lambda t: t["trade_date"])
+    for t in ticker_sells:
+        t_date = datetime.strptime(t["trade_date"], "%Y-%m-%d")
+        window = [o for o in ticker_sells
+                  if o["name"] != t["name"]
+                  and abs((datetime.strptime(o["trade_date"], "%Y-%m-%d") - t_date).days) <= 7]
+        if window:
+            cluster_sells.append(t)
+        else:
+            non_cluster_sells.append(t)
+
+def _sell_adj_rets(trade_list, horizon="60d"):
+    key = "price_60d" if horizon == "60d" else "price_90d"
+    return [r for t in trade_list
+            for r in [-ret(t["price_at_trade"], t[key])]   # invert: sell wins if price fell
+            if ret(t["price_at_trade"], t[key]) is not None]
+
+cs_rets  = _sell_adj_rets(cluster_sells,     "60d")
+ncs_rets = _sell_adj_rets(non_cluster_sells, "60d")
+scs  = stats(cs_rets)
+sncs = stats(ncs_rets)
+
+print(f"\n  Cluster sells (adj)    : N={scs['n']:,}  Win%={scs['win_rate']:.1f}%  AvgRet={scs['avg_ret']:+.1f}%  MedRet={scs['med_ret']:+.1f}%")
+print(f"  Non-cluster sells (adj): N={sncs['n']:,}  Win%={sncs['win_rate']:.1f}%  AvgRet={sncs['avg_ret']:+.1f}%  MedRet={sncs['med_ret']:+.1f}%")
+if scs['n'] and sncs['n']:
+    print(f"  Cluster sell edge      : {scs['avg_ret'] - sncs['avg_ret']:+.1f}% avg return advantage")
+
+# Cluster sells by chamber
+print(f"\n  Cluster sells by chamber @ 60d (direction-adjusted):")
+for chamber in ["Senate", "House"]:
+    sub = [t for t in cluster_sells if (t["chamber"] or "") == chamber]
+    rets = _sell_adj_rets(sub, "60d")
+    if rets:
+        s = stats(rets)
+        print(f"    {chamber:<8}: N={s['n']:,}  Win%={s['win_rate']:.1f}%  AvgRet={s['avg_ret']:+.1f}%")
+
+# Cluster sells by position size
+print(f"\n  Cluster sells by position size @ 60d (min n=5):")
+print(f"  {'SizeBracket':<16}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}  {'MedRet':>8}")
+print(f"  {'-'*16}  {'-----':>5}  {'----':>7}  {'------':>8}  {'------':>8}")
+for sz in SIZE_ORDER:
+    sub = [t for t in cluster_sells if amount_bracket(t["amount"]) == sz]
+    rets = _sell_adj_rets(sub, "60d")
+    if len(rets) >= 5:
+        s = stats(rets)
+        print(f"  {sz:<16}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%  {s['med_ret']:>+7.1f}%")
+
+# Cluster sells by era
+print(f"\n  Cluster sell alpha by era @ 60d:")
+for era_label, since, until in ERAS:
+    sub = era_filter(cluster_sells, since, until)
+    rets = _sell_adj_rets(sub, "60d")
+    if len(rets) >= 10:
+        s = stats(rets)
+        print(f"    {era_label:<12}: N={s['n']:,}  Win%={s['win_rate']:.1f}%  AvgRet={s['avg_ret']:+.1f}%")
+
+# ── 28. 7-DAY SUCCESSIVE TRADES BY SAME POLITICIAN ────────────────────────────
+# A politician trades ticker X, then trades X again within 7 calendar days.
+# Tests whether rapid accumulation / distribution within a week signals alpha.
+print(f"\n{'='*70}")
+print("  7-DAY SUCCESSIVE TRADES — SAME POLITICIAN, SAME TICKER  @ 60d & 90d")
+print("  (politician trades ticker, then trades it again within 7 days)")
+print(f"{'='*70}")
+
+# Build by (politician, ticker) — all trade types
+all_dated = [t for t in trades if t["trade_date"]]
+all_dated.sort(key=lambda t: (t["name"] or "", t["ticker"] or "", t["trade_date"]))
+
+by_pol_ticker = defaultdict(list)
+for t in all_dated:
+    by_pol_ticker[(t["name"], t["ticker"])].append(t)
+
+successive_7d_buys  = []   # buy trades that are part of a 7-day successive pair
+successive_7d_sells = []
+solo_7d_buys        = []   # buys with no 7-day partner
+solo_7d_sells       = []
+
+for (name, ticker), tlist in by_pol_ticker.items():
+    tlist.sort(key=lambda t: t["trade_date"])
+    n_t = len(tlist)
+    in_7d_window = [False] * n_t
+
+    for i in range(n_t):
+        d_i = datetime.strptime(tlist[i]["trade_date"], "%Y-%m-%d")
+        for j in range(i + 1, n_t):
+            d_j = datetime.strptime(tlist[j]["trade_date"], "%Y-%m-%d")
+            if (d_j - d_i).days <= 7:
+                in_7d_window[i] = True
+                in_7d_window[j] = True
+            else:
+                break   # sorted, so no further j qualifies for this i
+
+    for i, t in enumerate(tlist):
+        if is_buy(t):
+            if in_7d_window[i]:
+                successive_7d_buys.append(t)
+            else:
+                solo_7d_buys.append(t)
+        elif is_sell(t):
+            if in_7d_window[i]:
+                successive_7d_sells.append(t)
+            else:
+                solo_7d_sells.append(t)
+
+# Stats at 60d & 90d
+def buy_rets_60_90(tlist):
+    r60 = [r for t in tlist for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    r90 = [r for t in tlist for r in [ret(t["price_at_trade"], t["price_90d"])] if r is not None]
+    return stats(r60), stats(r90)
+
+def sell_adj_rets_60_90(tlist):
+    r60 = _sell_adj_rets(tlist, "60d")
+    r90 = _sell_adj_rets(tlist, "90d")
+    return stats(r60), stats(r90)
+
+sb_60,  sb_90  = buy_rets_60_90(successive_7d_buys)
+slb_60, slb_90 = buy_rets_60_90(solo_7d_buys)
+ss_60,  ss_90  = sell_adj_rets_60_90(successive_7d_sells)
+sls_60, sls_90 = sell_adj_rets_60_90(solo_7d_sells)
+
+print(f"\n  {'Group':<35}  {'N@60d':>6}  {'Win%@60':>8}  {'Ret@60':>7}  {'N@90d':>6}  {'Win%@90':>8}  {'Ret@90':>7}")
+print(f"  {'-'*35}  {'------':>6}  {'-'*8}  {'-'*7}  {'------':>6}  {'-'*8}  {'-'*7}")
+for label, s60, s90 in [
+    ("7-day successive BUYS",             sb_60,  sb_90),
+    ("Solo buys (no 7d repeat)",          slb_60, slb_90),
+    ("7-day successive SELLS (adj)",      ss_60,  ss_90),
+    ("Solo sells (no 7d repeat) (adj)",   sls_60, sls_90),
+]:
+    w60 = f"{s60['win_rate']:.1f}%" if s60["n"] else "—"
+    w90 = f"{s90['win_rate']:.1f}%" if s90["n"] else "—"
+    r60 = f"{s60['avg_ret']:>+.1f}%" if s60["n"] else "—"
+    r90 = f"{s90['avg_ret']:>+.1f}%" if s90["n"] else "—"
+    print(f"  {label:<35}  {s60['n']:>6,}  {w60:>8}  {r60:>7}  {s90['n']:>6,}  {w90:>8}  {r90:>7}")
+
+# Successive 7d by chamber
+print(f"\n  7-day successive BUYS by chamber @ 60d:")
+for chamber in ["Senate", "House"]:
+    sub = [t for t in successive_7d_buys if (t["chamber"] or "") == chamber]
+    s60, _ = buy_rets_60_90(sub)
+    if s60["n"]:
+        print(f"    {chamber:<8}: N={s60['n']:,}  Win%={s60['win_rate']:.1f}%  AvgRet={s60['avg_ret']:+.1f}%")
+
+print(f"\n  7-day successive SELLS by chamber @ 60d (adj):")
+for chamber in ["Senate", "House"]:
+    sub = [t for t in successive_7d_sells if (t["chamber"] or "") == chamber]
+    rets = _sell_adj_rets(sub, "60d")
+    if rets:
+        s = stats(rets)
+        print(f"    {chamber:<8}: N={s['n']:,}  Win%={s['win_rate']:.1f}%  AvgRet={s['avg_ret']:+.1f}%")
+
+# Successive 7d buys by position size
+print(f"\n  7-day successive BUYS by position size @ 60d (min n=5):")
+print(f"  {'SizeBracket':<16}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}")
+print(f"  {'-'*16}  {'-----':>5}  {'----':>7}  {'------':>8}")
+for sz in SIZE_ORDER:
+    sub = [t for t in successive_7d_buys if amount_bracket(t["amount"]) == sz]
+    s60, _ = buy_rets_60_90(sub)
+    if s60["n"] >= 5:
+        print(f"  {sz:<16}  {s60['n']:>5,}  {s60['win_rate']:>6.1f}%  {s60['avg_ret']:>+7.1f}%")
+
+# Successive 7d sells by position size
+print(f"\n  7-day successive SELLS by position size @ 60d adj (min n=5):")
+print(f"  {'SizeBracket':<16}  {'N':>5}  {'Win%':>7}  {'AvgRet':>8}")
+print(f"  {'-'*16}  {'-----':>5}  {'----':>7}  {'------':>8}")
+for sz in SIZE_ORDER:
+    sub = [t for t in successive_7d_sells if amount_bracket(t["amount"]) == sz]
+    rets = _sell_adj_rets(sub, "60d")
+    if len(rets) >= 5:
+        s = stats(rets)
+        print(f"  {sz:<16}  {s['n']:>5,}  {s['win_rate']:>6.1f}%  {s['avg_ret']:>+7.1f}%")
+
+# Successive 7d buys by era
+print(f"\n  7-day successive BUYS by era @ 60d:")
+for era_label, since, until in ERAS:
+    sub = era_filter(successive_7d_buys, since, until)
+    s60, _ = buy_rets_60_90(sub)
+    if s60["n"] >= 10:
+        print(f"    {era_label:<12}: N={s60['n']:,}  Win%={s60['win_rate']:.1f}%  AvgRet={s60['avg_ret']:+.1f}%")
+
+print(f"\n  7-day successive SELLS by era @ 60d (adj):")
+for era_label, since, until in ERAS:
+    sub = era_filter(successive_7d_sells, since, until)
+    rets = _sell_adj_rets(sub, "60d")
+    if len(rets) >= 10:
+        s = stats(rets)
+        print(f"    {era_label:<12}: N={s['n']:,}  Win%={s['win_rate']:.1f}%  AvgRet={s['avg_ret']:+.1f}%")
+
+# ── 29. ADD MISSING SIGNALS TO LEADERBOARD ────────────────────────────────────
+# Re-score and extend the leaderboard with cluster sells + successive 7d signals
+print(f"\n{'='*70}")
+print("  EXTENDED LEADERBOARD — ALL SIGNALS INCLUDING CLUSTER SELLS & 7-DAY SUCCESSIVE")
+print(f"{'='*70}")
+
+def add_sell_signal(label, trade_list, era="ALL"):
+    rets = _sell_adj_rets(trade_list, "60d")
+    if len(rets) < 20:
+        return
+    s = stats(rets)
+    leaderboard.append((label, era, s, composite(s)))
+
+def add_buy_signal(label, trade_list, era="ALL"):
+    rets = [r for t in trade_list for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    if len(rets) < 20:
+        return
+    s = stats(rets)
+    leaderboard.append((label, era, s, composite(s)))
+
+for era_label, since, until in ERAS:
+    cs_era   = era_filter(cluster_sells,     since, until)
+    ncs_era  = era_filter(non_cluster_sells, since, until)
+    s7b_era  = era_filter(successive_7d_buys,  since, until)
+    s7s_era  = era_filter(successive_7d_sells, since, until)
+    sl7b_era = era_filter(solo_7d_buys,        since, until)
+    sl7s_era = era_filter(solo_7d_sells,       since, until)
+
+    add_sell_signal("Cluster SELLS",                cs_era, era_label)
+    add_sell_signal("Non-cluster SELLS",            ncs_era, era_label)
+    add_sell_signal("Senate Cluster SELLS",         [t for t in cs_era if (t["chamber"] or "") == "Senate"], era_label)
+    add_sell_signal("House Cluster SELLS",          [t for t in cs_era if (t["chamber"] or "") == "House"], era_label)
+    add_buy_signal("7d Successive BUYS",            s7b_era, era_label)
+    add_sell_signal("7d Successive SELLS",          s7s_era, era_label)
+    add_buy_signal("Senate 7d Successive BUYS",    [t for t in s7b_era if (t["chamber"] or "") == "Senate"], era_label)
+    add_buy_signal("House 7d Successive BUYS",     [t for t in s7b_era if (t["chamber"] or "") == "House"], era_label)
+    add_buy_signal("7d Succ BUYS ≥$100K",          [t for t in s7b_era if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")], era_label)
+    add_sell_signal("7d Succ SELLS ≥$100K",        [t for t in s7s_era if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")], era_label)
+    add_sell_signal("Cluster SELLS ≥$100K",        [t for t in cs_era if amount_bracket(t["amount"]) in ("$100K–$250K","$250K–$500K","$500K–$1M","$1M+")], era_label)
+
+leaderboard.sort(key=lambda x: x[3], reverse=True)
+# Deduplicate (same label+era may appear from both passes — keep highest score)
+seen = set()
+deduped = []
+for row in leaderboard:
+    key = (row[0], row[1])
+    if key not in seen:
+        seen.add(key)
+        deduped.append(row)
+
+print(f"\n  TOP 40 SIGNAL + ERA COMBINATIONS  (composite score)")
+print(f"  {'Signal':<35}  {'Era':<12}  {'N':>6}  {'Win%':>8}  {'AvgRet':>8}  {'Score':>7}")
+print(f"  {'-'*35}  {'-'*12}  {'------':>6}  {'------':>8}  {'------':>8}  {'-----':>7}")
+for label, era, s, score in deduped[:40]:
+    print(f"  {label:<35}  {era:<12}  {s['n']:>6,}  {s['win_rate']:>7.1f}%  {s['avg_ret']:>+7.1f}%  {score:>7.2f}")
+
+print(f"\n  BOTTOM 10 SIGNALS (worst composite score, min n=20):")
+print(f"  {'Signal':<35}  {'Era':<12}  {'N':>6}  {'Win%':>8}  {'AvgRet':>8}  {'Score':>7}")
+print(f"  {'-'*35}  {'-'*12}  {'------':>6}  {'------':>8}  {'------':>8}  {'-----':>7}")
+worst2 = [x for x in deduped if x[2]["n"] >= 20]
+worst2.sort(key=lambda x: x[3])
+for label, era, s, score in worst2[:10]:
+    print(f"  {label:<35}  {era:<12}  {s['n']:>6,}  {s['win_rate']:>7.1f}%  {s['avg_ret']:>+7.1f}%  {score:>7.2f}")
+
 print(f"\n{'='*70}")
 print("  ANALYSIS COMPLETE")
 print(f"{'='*70}\n")
