@@ -160,6 +160,126 @@ class EarningsSurprise(Base):
     )
 
 
+class TechnicalsSnapshot(Base):
+    """Daily technicals snapshot — covers Moving Averages + Market Strength tabs."""
+    __tablename__ = "technicals_snapshot"
+
+    id            = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date,    nullable=False)
+    universe      = Column(String(50), nullable=False)
+    ticker        = Column(String(20), nullable=False)
+
+    # Simple moving averages
+    sma_20  = Column(Float)
+    sma_50  = Column(Float)
+    sma_200 = Column(Float)
+
+    # Exponential moving averages
+    ema_9   = Column(Float)
+    ema_21  = Column(Float)
+
+    # Price position relative to MAs (%)
+    price_vs_sma20  = Column(Float)
+    price_vs_sma50  = Column(Float)
+    price_vs_sma200 = Column(Float)
+
+    # Momentum
+    rsi_14 = Column(Float)
+
+    # 52-week range
+    high_52w          = Column(Float)
+    low_52w           = Column(Float)
+    pct_from_high_52w = Column(Float)   # negative = below high
+    pct_from_low_52w  = Column(Float)   # positive = above low
+
+    # Volume
+    avg_vol_20d = Column(Float)
+    vol_ratio   = Column(Float)   # today / 20d avg
+
+    # Relative strength vs SPY (excess return %)
+    rel_strength_1m = Column(Float)
+    rel_strength_3m = Column(Float)
+    rel_strength_6m = Column(Float)
+
+    # Beta (30-day rolling vs SPY)
+    beta_30d = Column(Float)
+
+    # MA cross signal string (mirrors frontend maGetCross return value)
+    cross_signal = Column(String(20))   # 'golden_cross'|'death_cross'|'above_200'|'below_200'
+
+    # MA alignment signal (mirrors frontend maGetAlignment return value)
+    alignment    = Column(String(20))   # 'bull_stack'|'bear_stack'|'bullish'|'bearish'|'mixed'
+
+    # ADX / Directional Movement (Market Strength tab — techCalcADX)
+    adx          = Column(Float)
+    plus_di      = Column(Float)
+    minus_di     = Column(Float)
+    di_cross     = Column(String(20))   # 'bull_cross'|'bear_cross'|'bull'|'bear'
+
+    # ATR-14 (Market Strength tab)
+    atr          = Column(Float)
+
+    # Legacy boolean columns kept for any existing rows — new rows use cross_signal instead
+    golden_cross = Column(Boolean)
+    death_cross  = Column(Boolean)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_date", "universe", "ticker", name="uq_tech_snap"),
+        Index("ix_tech_ticker",   "ticker"),
+        Index("ix_tech_universe", "universe", "snapshot_date"),
+    )
+
+
+class WingSnapshot(Base):
+    """
+    Wing Scanner results — one row per equidistant OTM put/call pair with confirmed IV skew bias.
+    Mirrors the frontend Wing Scanner (panel-wing) using Tradier API.
+    Multiple rows per (date, universe, ticker) — one per detected pair.
+    """
+    __tablename__ = "wing_snapshot"
+
+    id            = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date,    nullable=False)
+    universe      = Column(String(50), nullable=False)
+    ticker        = Column(String(20), nullable=False)
+
+    expiry        = Column(String(10), nullable=False)   # YYYY-MM-DD
+    dte           = Column(Integer)                      # days to expiry
+    otm_pct       = Column(Float)                        # % OTM of put below spot
+    spot          = Column(Float)                        # underlying price at scan time
+
+    put_strike    = Column(Float,  nullable=False)
+    call_strike   = Column(Float)                        # equidistant on the call side
+
+    # IVs stored as percentages (e.g. 35.0 = 35%)
+    put_iv        = Column(Float)
+    call_iv       = Column(Float)
+    iv_diff       = Column(Float)   # put_iv - call_iv; negative = put bias, positive = call bias
+
+    bias          = Column(String(10))   # 'put' | 'call'
+
+    put_volume    = Column(Integer)
+    call_volume   = Column(Integer)
+    put_oi        = Column(Integer)
+    call_oi       = Column(Integer)
+    pcr           = Column(Float)        # put_oi / call_oi
+
+    put_mid       = Column(Float)        # option mid price
+    call_mid      = Column(Float)
+
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_date", "universe", "ticker", "expiry", "put_strike",
+                         name="uq_wing_snap"),
+        Index("ix_wing_ticker",   "ticker"),
+        Index("ix_wing_universe", "universe", "snapshot_date"),
+        Index("ix_wing_bias",     "bias"),
+    )
+
+
 class ReportCalendar(Base):
     """Upcoming earnings report dates fetched from FMP earnings calendar."""
     __tablename__ = "report_calendar"
@@ -201,6 +321,18 @@ def init_db():
         # Widen uq_pol_trade to include amount (Sep 2026) — drop old, add new (idempotent via IF NOT EXISTS)
         "ALTER TABLE political_trades DROP CONSTRAINT IF EXISTS uq_pol_trade",
         "ALTER TABLE political_trades ADD CONSTRAINT uq_pol_trade UNIQUE (chamber, name, ticker, trade_date, type, amount)",
+        # technicals_snapshot columns added Sep 2026
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS golden_cross BOOLEAN",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS death_cross  BOOLEAN",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS rel_strength_6m FLOAT",
+        # technicals_snapshot: MA cross + Market Strength columns (mirrors frontend maScanTicker / techScanTicker)
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS cross_signal VARCHAR(20)",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS alignment    VARCHAR(20)",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS adx          FLOAT",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS plus_di      FLOAT",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS minus_di     FLOAT",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS di_cross     VARCHAR(20)",
+        "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS atr          FLOAT",
     ]
     for sql in _migrations:
         try:
@@ -354,6 +486,154 @@ def get_fundamentals_snapshot(universe: str) -> list:
         return [_row_to_dict(r) for r in rows]
     except Exception as e:
         print(f"[db] get_fundamentals_snapshot error: {e}")
+        return []
+    finally:
+        session.close()
+
+
+# ── Technicals snapshot functions ────────────────────────────────────────────
+
+def save_technicals_snapshot(universe: str, results: list):
+    """Upsert technicals rows for today. One row per (date, universe, ticker)."""
+    if not results:
+        return
+    today = date.today()
+    session = _Session()
+    inserted = updated = 0
+    try:
+        for row in results:
+            ticker = (row.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            existing = session.query(TechnicalsSnapshot).filter_by(
+                snapshot_date=today, universe=universe, ticker=ticker,
+            ).first()
+            fields = {k: row.get(k) for k in (
+                "sma_20", "sma_50", "sma_200", "ema_9", "ema_21",
+                "price_vs_sma20", "price_vs_sma50", "price_vs_sma200",
+                "rsi_14", "high_52w", "low_52w",
+                "pct_from_high_52w", "pct_from_low_52w",
+                "avg_vol_20d", "vol_ratio",
+                "rel_strength_1m", "rel_strength_3m", "rel_strength_6m",
+                "beta_30d", "golden_cross", "death_cross",
+                # MA cross + Market Strength (mirrors frontend maScanTicker / techScanTicker)
+                "cross_signal", "alignment",
+                "adx", "plus_di", "minus_di", "di_cross", "atr",
+            )}
+            if existing:
+                for k, v in fields.items():
+                    setattr(existing, k, v)
+                updated += 1
+            else:
+                session.add(TechnicalsSnapshot(
+                    snapshot_date=today, universe=universe, ticker=ticker, **fields,
+                ))
+                inserted += 1
+        session.commit()
+        logger.info("Technicals snapshot saved — %s %s: %d inserted, %d updated",
+                    today, universe, inserted, updated)
+    except Exception as exc:
+        session.rollback()
+        logger.error("save_technicals_snapshot error: %s", exc)
+    finally:
+        session.close()
+
+
+def get_technicals_snapshot(universe: str) -> list:
+    """Return the latest technicals row for each ticker in a universe."""
+    session = _Session()
+    try:
+        rows = session.execute(text("""
+            SELECT DISTINCT ON (ticker) *
+            FROM technicals_snapshot
+            WHERE universe = :u
+            ORDER BY ticker, snapshot_date DESC
+        """), {"u": universe}).fetchall()
+        return [dict(r._mapping) for r in rows]
+    except Exception as e:
+        logger.error("get_technicals_snapshot error: %s", e)
+        return []
+    finally:
+        session.close()
+
+
+# ── Wing snapshot functions (Options Skew tab) ────────────────────────────────
+
+def save_wing_snapshot(universe: str, pairs: list):
+    """
+    Upsert wing scan pair rows for today.
+    Multiple rows per ticker (one per detected equidistant OTM pair).
+    """
+    if not pairs:
+        return
+    today = date.today()
+    session = _Session()
+    inserted = updated = 0
+    try:
+        for row in pairs:
+            ticker     = (row.get("ticker") or "").upper()
+            expiry     = row.get("expiry", "")
+            put_strike = row.get("put_strike")
+            if not ticker or not expiry or put_strike is None:
+                continue
+            existing = session.query(WingSnapshot).filter_by(
+                snapshot_date=today,
+                universe=universe,
+                ticker=ticker,
+                expiry=expiry,
+                put_strike=put_strike,
+            ).first()
+            fields = {k: row.get(k) for k in (
+                "dte", "otm_pct", "spot", "call_strike",
+                "put_iv", "call_iv", "iv_diff", "bias",
+                "put_volume", "call_volume", "put_oi", "call_oi",
+                "pcr", "put_mid", "call_mid",
+            )}
+            if existing:
+                for k, v in fields.items():
+                    setattr(existing, k, v)
+                updated += 1
+            else:
+                session.add(WingSnapshot(
+                    snapshot_date=today,
+                    universe=universe,
+                    ticker=ticker,
+                    expiry=expiry,
+                    put_strike=put_strike,
+                    **fields,
+                ))
+                inserted += 1
+        session.commit()
+        logger.info("Wing snapshot saved — %s %s: %d inserted, %d updated",
+                    today, universe, inserted, updated)
+    except Exception as exc:
+        session.rollback()
+        logger.error("save_wing_snapshot error: %s", exc)
+    finally:
+        session.close()
+
+
+def get_wing_snapshot(universe: str, bias: str = None) -> list:
+    """
+    Return the most recent wing scan results for a universe.
+    bias: 'put' | 'call' | None (returns all).
+    """
+    session = _Session()
+    try:
+        rows = session.execute(text("""
+            SELECT * FROM wing_snapshot
+            WHERE universe = :u
+              AND snapshot_date = (
+                  SELECT MAX(snapshot_date) FROM wing_snapshot WHERE universe = :u
+              )
+            ORDER BY ticker, expiry, put_strike
+        """), {"u": universe}).fetchall()
+        result = [dict(r._mapping) for r in rows]
+        if bias and bias != "all":
+            result = [r for r in result if r.get("bias") == bias]
+        return result
+    except Exception as e:
+        logger.error("get_wing_snapshot error: %s", e)
         return []
     finally:
         session.close()

@@ -218,6 +218,558 @@ def _earnings_backfill():
     logger.info("=== Earnings initial backfill complete ===")
 
 
+# ── Technicals & Options EOD helpers ─────────────────────────────────────────
+
+def _sma(closes: list, period: int):
+    if len(closes) < period:
+        return None
+    return round(sum(closes[-period:]) / period, 4)
+
+def _ema(closes: list, period: int):
+    if len(closes) < period:
+        return None
+    k = 2.0 / (period + 1)
+    val = sum(closes[:period]) / period
+    for p in closes[period:]:
+        val = p * k + val * (1 - k)
+    return round(val, 4)
+
+def _rsi(closes: list, period: int = 14):
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_g = sum(gains[-period:]) / period
+    avg_l = sum(losses[-period:]) / period
+    if avg_l == 0:
+        return 100.0
+    return round(100 - 100 / (1 + avg_g / avg_l), 2)
+
+
+def _adx(highs: list, lows: list, closes: list, period: int = 14):
+    """
+    Wilder-smoothed ADX, mirroring techCalcADX from osprey.html exactly.
+    Returns (adx, plus_di, minus_di, prev_plus_di, prev_minus_di).
+    All values as float % (e.g. 25.3), or (None, …) if insufficient data.
+    """
+    n = len(closes)
+    if n < period * 2:
+        return None, None, None, None, None
+
+    tr_arr, plus_dm, minus_dm = [], [], []
+    for i in range(1, n):
+        hl  = highs[i] - lows[i]
+        hpc = abs(highs[i] - closes[i - 1])
+        lpc = abs(lows[i]  - closes[i - 1])
+        tr_arr.append(max(hl, hpc, lpc))
+
+        up_move   = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        plus_dm.append(up_move   if up_move   > down_move and up_move   > 0 else 0.0)
+        minus_dm.append(down_move if down_move > up_move  and down_move > 0 else 0.0)
+
+    sm_tr  = sum(tr_arr[:period])
+    sm_pdm = sum(plus_dm[:period])
+    sm_mdm = sum(minus_dm[:period])
+
+    di_plus, di_minus, dx_arr = [], [], []
+    pdi = (sm_pdm / sm_tr * 100) if sm_tr > 0 else 0.0
+    mdi = (sm_mdm / sm_tr * 100) if sm_tr > 0 else 0.0
+    di_plus.append(pdi)
+    di_minus.append(mdi)
+    dx_arr.append(abs(pdi - mdi) / (pdi + mdi) * 100 if (pdi + mdi) > 0 else 0.0)
+
+    for i in range(period, len(tr_arr)):
+        sm_tr  = sm_tr  - sm_tr  / period + tr_arr[i]
+        sm_pdm = sm_pdm - sm_pdm / period + plus_dm[i]
+        sm_mdm = sm_mdm - sm_mdm / period + minus_dm[i]
+
+        pdi = (sm_pdm / sm_tr * 100) if sm_tr > 0 else 0.0
+        mdi = (sm_mdm / sm_tr * 100) if sm_tr > 0 else 0.0
+        di_plus.append(pdi)
+        di_minus.append(mdi)
+        dx_arr.append(abs(pdi - mdi) / (pdi + mdi) * 100 if (pdi + mdi) > 0 else 0.0)
+
+    if len(dx_arr) < period:
+        return None, None, None, None, None
+
+    adx_val = sum(dx_arr[:period]) / period
+    for i in range(period, len(dx_arr)):
+        adx_val = (adx_val * (period - 1) + dx_arr[i]) / period
+
+    last = len(di_plus) - 1
+    if last < 1:
+        return None, None, None, None, None
+
+    return (
+        round(adx_val,        2),
+        round(di_plus[last],  2),
+        round(di_minus[last], 2),
+        round(di_plus[last - 1],  2),
+        round(di_minus[last - 1], 2),
+    )
+
+
+def _atr(highs: list, lows: list, closes: list, period: int = 14) -> float | None:
+    """ATR-{period}, mirroring techCalcATR from osprey.html."""
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        trs.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        ))
+    atr = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+    return round(atr, 4)
+
+
+def _tradier_history(ticker: str, tradier_key: str, days: int = 310) -> dict | None:
+    """
+    Fetch daily OHLCV history from Tradier for the past `days` calendar days.
+    Mirrors the techFetch('/markets/history?...') call used by both
+    maScanTicker (310d) and techScanTicker (120d) in osprey.html.
+    Returns dict with lists: dates, opens, highs, lows, closes, volumes (oldest→newest).
+    Returns None on failure.
+    """
+    import requests as _req
+    end_dt   = date.today()
+    start_dt = end_dt - timedelta(days=days)
+    hdrs     = {"Authorization": f"Bearer {tradier_key}", "Accept": "application/json"}
+    try:
+        r = _req.get(
+            "https://api.tradier.com/v1/markets/history",
+            params={
+                "symbol":   ticker,
+                "interval": "daily",
+                "start":    start_dt.strftime("%Y-%m-%d"),
+                "end":      end_dt.strftime("%Y-%m-%d"),
+            },
+            headers=hdrs,
+            timeout=15,
+        )
+        if not r.ok:
+            return None
+        hist = r.json().get("history") or {}
+        if not hist or hist == "null":
+            return None
+        day_data = hist.get("day", [])
+        if isinstance(day_data, dict):
+            day_data = [day_data]
+        if not day_data:
+            return None
+        return {
+            "dates":   [d["date"]                   for d in day_data],
+            "opens":   [float(d["open"])             for d in day_data],
+            "highs":   [float(d["high"])             for d in day_data],
+            "lows":    [float(d["low"])              for d in day_data],
+            "closes":  [float(d["close"])            for d in day_data],
+            "volumes": [int(d.get("volume") or 0)    for d in day_data],
+        }
+    except Exception as exc:
+        logger.warning("_tradier_history %s: %s", ticker, exc)
+        return None
+
+
+def _fetch_technicals_for_ticker(ticker: str, tradier_key: str) -> dict | None:
+    """
+    Pull 310-day daily OHLCV from Tradier and compute all technicals.
+
+    Mirrors the frontend exactly:
+      • maScanTicker  (Moving Averages tab)  — SMA 20/50/200, cross_signal, alignment
+      • techScanTicker (Market Strength tab) — RSI-14, ADX-14, +DI/-DI, di_cross, ATR-14, vol_ratio
+
+    Uses Tradier /markets/history (same call as the frontend techFetch helper).
+    TRADIER_API_KEY env var must be set; no yfinance dependency.
+    """
+    try:
+        hist = _tradier_history(ticker, tradier_key, days=310)
+        if not hist or len(hist["closes"]) < 10:
+            return None
+
+        closes  = hist["closes"]
+        highs   = hist["highs"]
+        lows    = hist["lows"]
+        volumes = hist["volumes"]
+        price   = closes[-1]
+
+        # ── Moving Averages tab (mirrors maScanTicker) ────────────────────────
+        sma_20  = _sma(closes, 20)
+        sma_50  = _sma(closes, 50)
+        sma_200 = _sma(closes, 200)
+        ema_9   = _ema(closes, 9)
+        ema_21  = _ema(closes, 21)
+
+        def _pct_vs(ma):
+            return round((price / ma - 1) * 100, 2) if ma and price else None
+
+        vs20  = _pct_vs(sma_20)
+        vs50  = _pct_vs(sma_50)
+        vs200 = _pct_vs(sma_200)
+
+        # cross_signal — mirrors maGetCross(sma50, sma200, sma50_prev, sma200_prev)
+        cross_signal = None
+        if sma_50 and sma_200:
+            sma_50_prev  = _sma(closes[:-1], 50)
+            sma_200_prev = _sma(closes[:-1], 200)
+            if sma_50_prev and sma_200_prev:
+                if   sma_50 > sma_200 and sma_50_prev <= sma_200_prev:
+                    cross_signal = "golden_cross"
+                elif sma_50 < sma_200 and sma_50_prev >= sma_200_prev:
+                    cross_signal = "death_cross"
+                elif sma_50 > sma_200:
+                    cross_signal = "above_200"
+                else:
+                    cross_signal = "below_200"
+
+        # alignment — mirrors maGetAlignment(price, sma20, sma50, sma200)
+        alignment = None
+        if sma_20 and sma_50 and sma_200:
+            if   price > sma_20 and sma_20 > sma_50 and sma_50 > sma_200:
+                alignment = "bull_stack"
+            elif price < sma_20 and sma_20 < sma_50 and sma_50 < sma_200:
+                alignment = "bear_stack"
+            elif price > sma_200:
+                alignment = "bullish"
+            elif price < sma_200:
+                alignment = "bearish"
+            else:
+                alignment = "mixed"
+
+        # ── Market Strength tab (mirrors techScanTicker) ──────────────────────
+        rsi_14 = _rsi(closes, 14)
+
+        adx_val, plus_di, minus_di, prev_pdi, prev_mdi = _adx(highs, lows, closes, 14)
+
+        # di_cross — mirrors techGetDICross(pdi, mdi, ppdi, pmdi)
+        di_cross = None
+        if plus_di is not None and minus_di is not None and prev_pdi is not None and prev_mdi is not None:
+            if   plus_di > minus_di and prev_pdi <= prev_mdi:
+                di_cross = "bull_cross"
+            elif plus_di < minus_di and prev_pdi >= prev_mdi:
+                di_cross = "bear_cross"
+            elif plus_di > minus_di:
+                di_cross = "bull"
+            else:
+                di_cross = "bear"
+
+        atr_14 = _atr(highs, lows, closes, 14)
+
+        # Volume metrics
+        avg_vol_20d = _sma(volumes, 20)
+        vol_ratio   = round(volumes[-1] / avg_vol_20d, 2) if avg_vol_20d and volumes else None
+
+        # 52-week range
+        high_52w = max(closes)
+        low_52w  = min(closes)
+
+        # Legacy boolean columns kept for backward-compat with existing rows
+        golden_cross = (cross_signal == "golden_cross")
+        death_cross  = (cross_signal == "death_cross")
+
+        return {
+            "ticker":            ticker,
+            "sma_20":            sma_20,
+            "sma_50":            sma_50,
+            "sma_200":           sma_200,
+            "ema_9":             ema_9,
+            "ema_21":            ema_21,
+            "price_vs_sma20":    vs20,
+            "price_vs_sma50":    vs50,
+            "price_vs_sma200":   vs200,
+            "rsi_14":            rsi_14,
+            "high_52w":          round(high_52w, 4),
+            "low_52w":           round(low_52w,  4),
+            "pct_from_high_52w": round((price / high_52w - 1) * 100, 2),
+            "pct_from_low_52w":  round((price / low_52w  - 1) * 100, 2),
+            "avg_vol_20d":       avg_vol_20d,
+            "vol_ratio":         vol_ratio,
+            "rel_strength_1m":   None,   # requires SPY benchmark — not available without yfinance
+            "rel_strength_3m":   None,
+            "rel_strength_6m":   None,
+            "beta_30d":          None,
+            "golden_cross":      golden_cross,
+            "death_cross":       death_cross,
+            # MA cross + alignment (Moving Averages tab)
+            "cross_signal":      cross_signal,
+            "alignment":         alignment,
+            # ADX / DI (Market Strength tab)
+            "adx":               adx_val,
+            "plus_di":           plus_di,
+            "minus_di":          minus_di,
+            "di_cross":          di_cross,
+            # ATR (Market Strength tab)
+            "atr":               atr_14,
+        }
+    except Exception as exc:
+        logger.warning("technicals fetch error %s: %s", ticker, exc)
+        return None
+
+
+def _wing_scan_ticker(ticker: str, tradier_key: str,
+                      min_otm: float = 0.20, min_iv_diff: float = 0.05,
+                      min_vol: int = 50, min_oi: int = 100) -> list:
+    """
+    Scan Tradier options chain for equidistant OTM put/call pairs with confirmed IV skew bias.
+    Mirrors the frontend Wing Scanner Web Worker logic exactly.
+
+    Filters applied (matching UI defaults):
+      - min_otm     = 0.20  (put must be ≥20% below spot)
+      - min_iv_diff = 0.05  (|put_iv - call_iv| ≥ 5 percentage points, in decimal)
+      - min_vol     = 50    (both legs must have ≥50 volume)
+      - min_oi      = 100   (both legs must have ≥100 open interest)
+
+    Bias confirmation (must pass to be included):
+      put  bias: iv_diff < 0  AND put_oi  > call_oi AND pcr > 1
+      call bias: iv_diff > 0  AND call_oi > put_oi  AND pcr < 1
+
+    Returns list of pair dicts (may be empty). IVs stored as % (e.g. 35.0 = 35%).
+    """
+    import requests as _req
+
+    base = "https://api.tradier.com/v1/markets"
+    hdrs = {"Authorization": f"Bearer {tradier_key}", "Accept": "application/json"}
+    current_year = str(date.today().year)
+    today_dt     = date.today()
+
+    try:
+        # 1 — Expirations (current year only)
+        r1 = _req.get(f"{base}/options/expirations",
+                      params={"symbol": ticker, "includeAllRoots": "true", "strikes": "true"},
+                      headers=hdrs, timeout=15)
+        if not r1.ok:
+            return []
+        exp_raw = r1.json().get("expirations", {}).get("date", [])
+        if not exp_raw:
+            return []
+        if isinstance(exp_raw, str):
+            exp_raw = [exp_raw]
+        expirations = [e for e in exp_raw if str(e).startswith(current_year)]
+        if not expirations:
+            return []
+
+        # 2 — Spot price
+        r2 = _req.get(f"{base}/quotes",
+                      params={"symbols": ticker, "greeks": "false"},
+                      headers=hdrs, timeout=15)
+        if not r2.ok:
+            return []
+        quote = r2.json().get("quotes", {}).get("quote", {})
+        if isinstance(quote, list):
+            quote = quote[0] if quote else {}
+        spot = quote.get("last") or quote.get("close") or quote.get("prevclose")
+        if not spot or spot <= 0:
+            return []
+        spot = float(spot)
+
+        pairs = []
+
+        # 3 — Per-expiration chain scan
+        for expiry in expirations:
+            try:
+                dte = (date.fromisoformat(str(expiry)) - today_dt).days
+                if dte < 0:
+                    continue
+
+                r3 = _req.get(f"{base}/options/chains",
+                              params={"symbol": ticker, "expiration": expiry, "greeks": "true"},
+                              headers=hdrs, timeout=20)
+                if not r3.ok:
+                    continue
+                chain = r3.json().get("options", {}).get("option", [])
+                if not chain:
+                    continue
+
+                puts_by_strike  = {}
+                calls_by_strike = {}
+                for opt in chain:
+                    s = opt.get("strike")
+                    if s is None:
+                        continue
+                    ot = opt.get("option_type")
+                    if ot == "put":
+                        puts_by_strike[float(s)]  = opt
+                    elif ot == "call":
+                        calls_by_strike[float(s)] = opt
+
+                def _get_iv(opt):
+                    """Extract IV in decimal form from greeks, with fallback chain."""
+                    if not opt:
+                        return None
+                    g = opt.get("greeks") or {}
+                    iv = g.get("mid_iv") or g.get("smv_vol") or g.get("ask_iv") or opt.get("implied_volatility")
+                    try:
+                        return float(iv) if iv is not None else None
+                    except (TypeError, ValueError):
+                        return None
+
+                def _mid(opt):
+                    try:
+                        bid = float(opt.get("bid") or 0)
+                        ask = float(opt.get("ask") or 0)
+                        return round((bid + ask) / 2, 4) if ask > 0 else None
+                    except (TypeError, ValueError):
+                        return None
+
+                call_strikes_sorted = sorted(calls_by_strike.keys())
+
+                for put_strike, put_opt in puts_by_strike.items():
+                    otm_pct = (spot - put_strike) / spot
+                    if otm_pct < min_otm:
+                        continue
+
+                    # Equidistant call: same absolute distance above spot
+                    call_target = spot + (spot - put_strike)
+                    if not call_strikes_sorted:
+                        continue
+                    call_strike = min(call_strikes_sorted, key=lambda s: abs(s - call_target))
+                    call_opt    = calls_by_strike.get(call_strike)
+                    if not call_opt:
+                        continue
+
+                    put_iv  = _get_iv(put_opt)
+                    call_iv = _get_iv(call_opt)
+                    if put_iv is None or call_iv is None:
+                        continue
+
+                    iv_diff = put_iv - call_iv   # decimal; negative = put skew
+                    if abs(iv_diff) < min_iv_diff:
+                        continue
+
+                    put_vol  = int(put_opt.get("volume")        or 0)
+                    call_vol = int(call_opt.get("volume")       or 0)
+                    put_oi_v = int(put_opt.get("open_interest") or 0)
+                    call_oi_v= int(call_opt.get("open_interest")or 0)
+
+                    if put_vol < min_vol or call_vol < min_vol:
+                        continue
+                    if put_oi_v < min_oi or call_oi_v < min_oi:
+                        continue
+
+                    pcr = round(put_oi_v / call_oi_v, 3) if call_oi_v > 0 else None
+
+                    put_bias  = iv_diff < 0 and put_oi_v > call_oi_v and pcr is not None and pcr > 1
+                    call_bias = iv_diff > 0 and call_oi_v > put_oi_v and pcr is not None and pcr < 1
+                    if not put_bias and not call_bias:
+                        continue
+
+                    pairs.append({
+                        "ticker":      ticker,
+                        "expiry":      str(expiry),
+                        "dte":         dte,
+                        "otm_pct":     round(otm_pct * 100, 2),   # % e.g. 22.5
+                        "spot":        round(spot, 4),
+                        "put_strike":  put_strike,
+                        "call_strike": call_strike,
+                        "put_iv":      round(put_iv  * 100, 4),   # % e.g. 35.0
+                        "call_iv":     round(call_iv * 100, 4),
+                        "iv_diff":     round(iv_diff * 100, 4),   # negative = put bias
+                        "bias":        "put" if put_bias else "call",
+                        "put_volume":  put_vol,
+                        "call_volume": call_vol,
+                        "put_oi":      put_oi_v,
+                        "call_oi":     call_oi_v,
+                        "pcr":         pcr,
+                        "put_mid":     _mid(put_opt),
+                        "call_mid":    _mid(call_opt),
+                    })
+
+            except Exception as exp_exc:
+                logger.warning("wing scan %s expiry %s: %s", ticker, expiry, exp_exc)
+                continue
+
+        return pairs
+
+    except Exception as exc:
+        logger.warning("wing scan error %s: %s", ticker, exc)
+        return []
+
+
+def _run_technicals_eod():
+    """
+    Fetch technicals for every tracked ticker via Tradier and persist to DB by universe.
+    Mirrors the exact frontend calls:
+      • maScanTicker  → Moving Averages tab (SMA 20/50/200, cross_signal, alignment)
+      • techScanTicker → Market Strength tab (RSI-14, ADX-14, +DI/-DI, di_cross, ATR-14)
+    Both tabs use Tradier /markets/history (310 calendar days per ticker).
+    """
+    from collections import defaultdict as _dd
+
+    tradier_key = os.environ.get('TRADIER_API_KEY', '')
+    if not tradier_key:
+        logger.warning("_run_technicals_eod: TRADIER_API_KEY not set — skipping")
+        return
+
+    all_tkrs = sorted(_all_tickers())
+    if not all_tkrs:
+        logger.warning("_run_technicals_eod: no tickers found")
+        return
+
+    universes_now = _load_universes_from_db()
+    results_by_u  = _dd(list)
+
+    logger.info("_run_technicals_eod: scanning %d tickers via Tradier", len(all_tkrs))
+    for ticker in all_tkrs:
+        data = _fetch_technicals_for_ticker(ticker, tradier_key)
+        if data:
+            for ukey, tlist in universes_now.items():
+                if ticker in tlist:
+                    results_by_u[ukey].append(data)
+        time.sleep(0.4)   # Tradier rate limit (~150 req/min on sandbox)
+
+    for ukey, rows in results_by_u.items():
+        if rows:
+            _db.save_technicals_snapshot(ukey, rows)
+    logger.info("_run_technicals_eod complete — %d universes written",
+                sum(1 for r in results_by_u.values() if r))
+
+
+def _run_wing_eod():
+    """
+    Run Tradier-based Wing Scanner across all tracked tickers and persist to DB by universe.
+    Uses the same filters as the frontend Wing Scanner (panel-wing):
+      min_otm=20%, min_iv_diff=5%, min_vol=50, min_oi=100.
+    """
+    from collections import defaultdict as _dd
+
+    tradier_key = os.environ.get('TRADIER_API_KEY', '')
+    if not tradier_key:
+        logger.warning("_run_wing_eod: TRADIER_API_KEY not set — skipping wing scan")
+        return
+
+    all_tkrs = sorted(_all_tickers())
+    if not all_tkrs:
+        logger.warning("_run_wing_eod: no tickers found")
+        return
+
+    universes_now = _load_universes_from_db()
+    results_by_u  = _dd(list)
+    total_pairs   = 0
+
+    logger.info("_run_wing_eod: scanning %d tickers via Tradier", len(all_tkrs))
+    for ticker in all_tkrs:
+        pairs = _wing_scan_ticker(ticker, tradier_key)
+        if pairs:
+            total_pairs += len(pairs)
+            for ukey, tlist in universes_now.items():
+                if ticker in tlist:
+                    results_by_u[ukey].extend(pairs)
+        time.sleep(0.6)   # Tradier rate limits; chains with greeks are heavy
+
+    for ukey, rows in results_by_u.items():
+        if rows:
+            _db.save_wing_snapshot(ukey, rows)
+
+    logger.info("_run_wing_eod complete — %d pairs found, %d universes written",
+                total_pairs, sum(1 for r in results_by_u.values() if r))
+
+
 def _background_scheduler():
     """
     On startup:
@@ -307,6 +859,20 @@ def _background_scheduler():
             logger.info("Political trades refresh-last-prices — %d rows updated", updated)
         except Exception as exc:
             logger.error("Political trades refresh-last-prices error: %s", exc)
+
+        # ── Technicals EOD (Moving Averages + Market Strength tabs) ───────────
+        try:
+            logger.info("Starting technicals EOD scan…")
+            _run_technicals_eod()
+        except Exception as exc:
+            logger.error("Technicals EOD error: %s", exc)
+
+        # ── Wing Scanner EOD (Options Skew tab) ──────────────────────────────
+        try:
+            logger.info("Starting wing scanner EOD (Tradier)…")
+            _run_wing_eod()
+        except Exception as exc:
+            logger.error("Wing scanner EOD error: %s", exc)
 
         # ── Weekly Sunday: refresh earnings calendar ──────────────────────────
         if date.today().weekday() == 6:  # 6 = Sunday
@@ -546,6 +1112,59 @@ def get_fundamentals():
     rows = _db.get_fundamentals_snapshot(universe)
     resp = jsonify({"results": rows, "universe": universe, "count": len(rows)})
     resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
+
+
+@app.route("/api/technicals")
+def get_technicals():
+    """
+    GET /api/technicals?universe=portfolio
+    Returns latest technicals snapshot (Moving Averages + Market Strength) from DB.
+    Falls back to a live yfinance fetch for any tickers with no stored row.
+    """
+    universe = request.args.get("universe", "portfolio")
+    rows = _db.get_technicals_snapshot(universe)
+
+    # Live fallback: if DB is empty for this universe (first run), compute on-demand via Tradier
+    if not rows:
+        logger.info("/api/technicals: no DB data for %s — live Tradier fetch", universe)
+        tradier_key = os.environ.get('TRADIER_API_KEY', '')
+        if tradier_key:
+            tickers = _resolve_universe_tickers(universe)
+            results = []
+            for tk in tickers:
+                data = _fetch_technicals_for_ticker(tk, tradier_key)
+                if data:
+                    results.append(data)
+                time.sleep(0.4)
+            if results:
+                _db.save_technicals_snapshot(universe, results)
+            rows = results
+        else:
+            logger.warning("/api/technicals: TRADIER_API_KEY not set — cannot live-fetch")
+
+    resp = jsonify({"results": rows, "universe": universe, "count": len(rows)})
+    resp.headers['Cache-Control'] = 'public, max-age=3600'
+    return resp
+
+
+@app.route("/api/options-skew")
+def get_options_skew():
+    """
+    GET /api/options-skew?universe=portfolio&bias=all
+    Returns latest Wing Scanner results from DB (Options Skew tab).
+
+    Query params:
+      universe  — universe key (default: portfolio)
+      bias      — 'put' | 'call' | 'all' (default: all)
+    """
+    universe = request.args.get("universe", "portfolio")
+    bias     = request.args.get("bias", "all")
+
+    rows = _db.get_wing_snapshot(universe, bias=None if bias == "all" else bias)
+
+    resp = jsonify({"results": rows, "universe": universe, "count": len(rows), "bias": bias})
+    resp.headers['Cache-Control'] = 'public, max-age=3600'
     return resp
 
 
