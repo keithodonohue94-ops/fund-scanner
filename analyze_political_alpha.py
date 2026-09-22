@@ -1210,3 +1210,161 @@ for label, era, s, score in worst2[:10]:
 print(f"\n{'='*70}")
 print("  ANALYSIS COMPLETE")
 print(f"{'='*70}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SECTION 30 — MASTER SUMMARY TABLE
+#  All signal categories × all 5 era windows in one grid.
+#  Format per cell: "WinRate% / AvgRet%"  (— if n < 10)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BIG_SIZES = ("$100K–$250K", "$250K–$500K", "$500K–$1M", "$1M+")
+
+def _wr_ret(rets, min_n=10):
+    """Return 'WR% / Ret%' string or '   —   ' if insufficient data."""
+    if len(rets) < min_n:
+        return "   —   "
+    s = stats(rets)
+    return f"{s['win_rate']:5.1f}% {s['avg_ret']:+6.1f}%"
+
+def _buy_cell(trade_list, since, until, min_n=10):
+    sub = era_filter(trade_list, since, until)
+    rets = [r for t in sub for r in [ret(t["price_at_trade"], t["price_60d"])] if r is not None]
+    return _wr_ret(rets, min_n)
+
+def _sell_cell(trade_list, since, until, min_n=10):
+    sub = era_filter(trade_list, since, until)
+    rets = _sell_adj_rets(sub, "60d")
+    return _wr_ret(rets, min_n)
+
+# Pre-build filter lists for buys/sells by chamber and size
+senate_buys  = [t for t in priced_60 if (t["chamber"] or "") == "Senate" and is_buy(t)]
+senate_sells = [t for t in priced_60 if (t["chamber"] or "") == "Senate" and is_sell(t)]
+house_buys   = [t for t in priced_60 if (t["chamber"] or "") == "House"  and is_buy(t)]
+house_sells  = [t for t in priced_60 if (t["chamber"] or "") == "House"  and is_sell(t)]
+
+sen_cluster_buys  = [t for t in cluster_trades if (t["chamber"] or "") == "Senate"]
+house_cluster_buys= [t for t in cluster_trades if (t["chamber"] or "") == "House"]
+sen_cluster_sells = [t for t in cluster_sells  if (t["chamber"] or "") == "Senate"]
+house_cluster_sells=[t for t in cluster_sells  if (t["chamber"] or "") == "House"]
+
+sen_7d_buys  = [t for t in successive_7d_buys  if (t["chamber"] or "") == "Senate"]
+house_7d_buys= [t for t in successive_7d_buys  if (t["chamber"] or "") == "House"]
+sen_7d_sells = [t for t in successive_7d_sells if (t["chamber"] or "") == "Senate"]
+house_7d_sells=[t for t in successive_7d_sells if (t["chamber"] or "") == "House"]
+
+CELL_W = 15  # "WW.W% +RR.R%" = 14 chars + 1 space
+
+def master_row(label, cell_fn_list):
+    """Print one row: label + one cell per era."""
+    line = f"  {label:<35}"
+    for cell_fn, (_, since, until) in zip(cell_fn_list, ERAS):
+        line += f"  {cell_fn(since, until):<{CELL_W}}"
+    print(line)
+
+def divider(title=""):
+    print(f"\n  {'─'*35}{'──' + '─'*CELL_W * len(ERAS)}")
+    if title:
+        print(f"  {title}")
+    print(f"  {'─'*35}{'──' + '─'*CELL_W * len(ERAS)}")
+
+print(f"\n{'='*90}")
+print("  MASTER SUMMARY TABLE — Win Rate & Avg Return @ 60d, direction-adjusted")
+print("  Format per cell:  WinRate%  AvgRet%     (— = fewer than 10 priced trades)")
+print(f"{'='*90}")
+
+# Header
+hdr = f"  {'Signal':<35}"
+for era_label, _, _ in ERAS:
+    hdr += f"  {era_label:<{CELL_W}}"
+print(hdr)
+sub_hdr = f"  {'':<35}"
+for _ in ERAS:
+    sub_hdr += f"  {'WR%   AvgRet':<{CELL_W}}"
+print(sub_hdr)
+print("  " + "─"*35 + ("  " + "─"*CELL_W) * len(ERAS))
+
+# ── CHAMBER × TYPE ──────────────────────────────────────────────────────────
+divider("CHAMBER × DIRECTION")
+master_row("Senate Buys",
+    [lambda s,u,tl=senate_buys:  _buy_cell(tl,s,u)] * 5)
+master_row("House Buys",
+    [lambda s,u,tl=house_buys:   _buy_cell(tl,s,u)] * 5)
+master_row("Senate Sells (adj)",
+    [lambda s,u,tl=senate_sells: _sell_cell(tl,s,u)] * 5)
+master_row("House Sells (adj)",
+    [lambda s,u,tl=house_sells:  _sell_cell(tl,s,u)] * 5)
+
+# ── CLUSTER BUYS ────────────────────────────────────────────────────────────
+divider("CLUSTER BUYS  (≥2 politicians, same ticker, 7 days)")
+master_row("Cluster Buys — all",
+    [lambda s,u,tl=cluster_trades:      _buy_cell(tl,s,u)] * 5)
+master_row("Senate Cluster Buys",
+    [lambda s,u,tl=sen_cluster_buys:    _buy_cell(tl,s,u)] * 5)
+master_row("House Cluster Buys",
+    [lambda s,u,tl=house_cluster_buys:  _buy_cell(tl,s,u)] * 5)
+master_row("Cluster Buys ≥$100K",
+    [lambda s,u,tl=[t for t in cluster_trades if amount_bracket(t["amount"]) in BIG_SIZES]: _buy_cell(tl,s,u)] * 5)
+
+# ── CLUSTER SELLS ────────────────────────────────────────────────────────────
+divider("CLUSTER SELLS  (≥2 politicians, same ticker, 7 days)")
+master_row("Cluster Sells — all (adj)",
+    [lambda s,u,tl=cluster_sells:       _sell_cell(tl,s,u)] * 5)
+master_row("Senate Cluster Sells (adj)",
+    [lambda s,u,tl=sen_cluster_sells:   _sell_cell(tl,s,u)] * 5)
+master_row("House Cluster Sells (adj)",
+    [lambda s,u,tl=house_cluster_sells: _sell_cell(tl,s,u)] * 5)
+master_row("Cluster Sells ≥$100K (adj)",
+    [lambda s,u,tl=[t for t in cluster_sells if amount_bracket(t["amount"]) in BIG_SIZES]: _sell_cell(tl,s,u)] * 5)
+
+# ── BUYS BY POSITION SIZE ────────────────────────────────────────────────────
+divider("BUYS BY POSITION SIZE")
+for sz in SIZE_ORDER:
+    tl = [t for t in priced_60 if is_buy(t) and amount_bracket(t["amount"]) == sz]
+    master_row(f"Buy {sz}",
+        [lambda s,u,tl=tl: _buy_cell(tl,s,u)] * 5)
+
+# ── SELLS BY POSITION SIZE ───────────────────────────────────────────────────
+divider("SELLS BY POSITION SIZE  (direction-adjusted)")
+for sz in SIZE_ORDER:
+    tl = [t for t in priced_60 if is_sell(t) and amount_bracket(t["amount"]) == sz]
+    master_row(f"Sell {sz} (adj)",
+        [lambda s,u,tl=tl: _sell_cell(tl,s,u)] * 5)
+
+# ── CLUSTER BUYS BY POSITION SIZE ────────────────────────────────────────────
+divider("CLUSTER BUYS BY POSITION SIZE")
+for sz in SIZE_ORDER:
+    tl = [t for t in cluster_trades if amount_bracket(t["amount"]) == sz]
+    master_row(f"Cluster Buy {sz}",
+        [lambda s,u,tl=tl: _buy_cell(tl,s,u,min_n=5)] * 5)
+
+# ── 7-DAY SUCCESSIVE TRADES ──────────────────────────────────────────────────
+divider("7-DAY SUCCESSIVE TRADES  (same politician, same ticker, ≤7 days)")
+master_row("7d Succ Buys — all",
+    [lambda s,u,tl=successive_7d_buys: _buy_cell(tl,s,u)] * 5)
+master_row("Senate 7d Succ Buys",
+    [lambda s,u,tl=sen_7d_buys:        _buy_cell(tl,s,u)] * 5)
+master_row("House 7d Succ Buys",
+    [lambda s,u,tl=house_7d_buys:      _buy_cell(tl,s,u)] * 5)
+master_row("7d Succ Sells — all (adj)",
+    [lambda s,u,tl=successive_7d_sells: _sell_cell(tl,s,u)] * 5)
+master_row("Senate 7d Succ Sells (adj)",
+    [lambda s,u,tl=sen_7d_sells:        _sell_cell(tl,s,u)] * 5)
+master_row("House 7d Succ Sells (adj)",
+    [lambda s,u,tl=house_7d_sells:      _sell_cell(tl,s,u)] * 5)
+
+divider("7-DAY SUCCESSIVE BUYS BY POSITION SIZE")
+for sz in SIZE_ORDER:
+    tl = [t for t in successive_7d_buys if amount_bracket(t["amount"]) == sz]
+    master_row(f"7d Succ Buy {sz}",
+        [lambda s,u,tl=tl: _buy_cell(tl,s,u,min_n=5)] * 5)
+
+divider("7-DAY SUCCESSIVE SELLS BY POSITION SIZE  (adj)")
+for sz in SIZE_ORDER:
+    tl = [t for t in successive_7d_sells if amount_bracket(t["amount"]) == sz]
+    master_row(f"7d Succ Sell {sz} (adj)",
+        [lambda s,u,tl=tl: _sell_cell(tl,s,u,min_n=5)] * 5)
+
+print(f"\n  {'='*90}")
+print("  END OF MASTER SUMMARY TABLE")
+print(f"  {'='*90}\n")
