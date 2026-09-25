@@ -98,7 +98,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year", "/api/political-trades/years", "/api/political-trades/months"):
+    if request.path in ("/api/health", "/api/ticker-sectors", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year", "/api/political-trades/years", "/api/political-trades/months"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -1209,6 +1209,22 @@ def get_political_trade_months():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/ticker-sectors")
+def get_ticker_sectors():
+    """GET /api/ticker-sectors — returns {ticker: sector} map for all tickers with known sector."""
+    try:
+        session = _db._Session()
+        rows = session.query(_db.TickerMetadata.ticker, _db.TickerMetadata.sector).filter(
+            _db.TickerMetadata.sector.isnot(None),
+            _db.TickerMetadata.sector != "",
+        ).all()
+        session.close()
+        return jsonify({r[0]: r[1] for r in rows})
+    except Exception as exc:
+        logger.error("ticker-sectors error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/political-trades/backfill", methods=["POST"])
 def backfill_political_trades():
     """POST /api/political-trades/backfill — fetch recent trades, upsert."""
@@ -1385,24 +1401,15 @@ def refresh_political_trades():
 @app.route("/api/political-trades/backfill-sectors", methods=["POST"])
 def backfill_political_trade_sectors():
     """POST /api/political-trades/backfill-sectors
-    1. Fetches FMP /profile for any ticker in political_trades not yet in ticker_metadata.
-    2. Backfills sector on existing political_trades rows that have empty sector.
+    Backfills sector on political_trades rows with empty sector using ticker_metadata
+    (the single source of truth, written by insider-scanner on universe save).
     """
-    from scanner import ensure_ticker_metadata
     try:
-        # Collect all unique tickers in political_trades
-        session = _db._Session()
-        try:
-            tickers = [r[0] for r in session.query(_db.PoliticalTrade.ticker).distinct().all()]
-        finally:
-            session.close()
-        # Ensure sector data exists in ticker_metadata for all tickers
-        sector_map = ensure_ticker_metadata(tickers)
-        # Backfill empty sector on existing rows
+        # Backfill sector on political_trades rows that have empty sector,
+        # using whatever is already in ticker_metadata (written by insider-scanner on universe save).
         updated = _db.backfill_political_trade_sectors()
         return jsonify({
             "status": "ok",
-            "tickers_resolved": len(sector_map),
             "rows_updated": updated,
         })
     except Exception as exc:

@@ -580,49 +580,15 @@ def _fetch_all(symbol: str) -> dict:
 
 
 # ── Ticker metadata (sector lookup) ──────────────────────────────────────────
+# ticker_metadata is the single source of truth for ticker→sector across the app.
+# It is written ONLY by insider-scanner on universe save (via ensure_ticker_metadata there).
+# Fund-scanner only reads from it.
 
-def _fmp_batch_profiles(tickers: list) -> dict:
-    """
-    Fetch FMP /profile for each ticker and return {ticker: {company_name, sector}}.
-    Called only for tickers not already in ticker_metadata DB.
-    """
-    if not FMP_API_KEY or not tickers:
-        return {}
-    result = {}
-    for ticker in tickers:
-        try:
-            data = _fmp_get(f"{FMP_STABLE}/profile", {"symbol": ticker.upper()})
-            if not data:
-                continue
-            p = data[0] if isinstance(data, list) and data else data
-            result[ticker.upper()] = {
-                "company_name": (p.get("companyName") or ""),
-                "sector":       (p.get("sector") or ""),
-            }
-        except Exception as exc:
-            logger.warning("_fmp_batch_profiles %s: %s", ticker, exc)
-        import time as _t
-        _t.sleep(0.1)
-    return result
-
-
-def ensure_ticker_metadata(tickers: list) -> dict:
-    """
-    Ensure all tickers have sector data in ticker_metadata DB.
-    1. Ask DB which tickers are missing sector.
-    2. Fetch FMP /profile for missing ones.
-    3. Upsert results into ticker_metadata.
-    4. Return full {ticker: sector} map for the given tickers.
-    """
+def get_ticker_sectors(tickers: list) -> dict:
+    """Return {ticker: sector} from shared ticker_metadata table. Read-only."""
     import db as _db
     if not tickers:
         return {}
-    missing = _db.get_tickers_missing_sector(list(tickers))
-    if missing:
-        logger.info("ensure_ticker_metadata: fetching FMP profiles for %d tickers", len(missing))
-        profiles = _fmp_batch_profiles(missing)
-        if profiles:
-            _db.upsert_ticker_metadata(profiles)
     return _db.get_ticker_sector_map(list(tickers))
 
 
@@ -907,7 +873,7 @@ def _fetch_political_trades(tickers: set = None, limit: int = None,
 
     # ── Enrich with sector from ticker_metadata ─────────────────────────────
     all_tickers_seen = list({r["ticker"] for r in results})
-    sector_map = ensure_ticker_metadata(all_tickers_seen)
+    sector_map = get_ticker_sectors(all_tickers_seen)
     for r in results:
         r["sector"] = sector_map.get(r["ticker"].upper(), "")
 
@@ -1093,7 +1059,7 @@ def fetch_political_trades_historical(from_date: str = "2025-01-01", to_date: st
 
     # Enrich sectors
     all_tickers_seen = list({r["ticker"] for r in results})
-    sector_map = ensure_ticker_metadata(all_tickers_seen)
+    sector_map = get_ticker_sectors(all_tickers_seen)
     for r in results:
         r["sector"] = sector_map.get(r["ticker"].upper(), "")
 
