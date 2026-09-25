@@ -988,10 +988,10 @@ def scan_tickers(tickers: list, delay: float = 0) -> list:
 
 # ── Historical political trades backfill ─────────────────────────────────────
 
-def fetch_political_trades_historical(from_date: str = "2025-01-01", max_pages: int = 150) -> list:
+def fetch_political_trades_historical(from_date: str = "2025-01-01", to_date: str = None, max_pages: int = 150) -> list:
     """
     Fetch ALL Senate + House trading disclosures from FMP paginated endpoints
-    (no symbol filter) going back to from_date (trade_date >= from_date).
+    (no symbol filter) for trade_date >= from_date (and <= to_date if supplied).
 
     Pages through results newest-first, stopping once all trades in a page
     predate from_date. Safe to call multiple times — upsert handles dedup.
@@ -1047,6 +1047,8 @@ def fetch_political_trades_historical(from_date: str = "2025-01-01", max_pages: 
             "link":       row.get("link") or "",
         }
 
+    UPPER = (to_date or "")[:10] or None   # optional upper bound on trade_date
+
     seen = set()
     results = []
 
@@ -1071,6 +1073,8 @@ def fetch_political_trades_historical(from_date: str = "2025-01-01", max_pages: 
                 if trade_dt < CUTOFF:
                     page_past_cutoff += 1
                     continue
+                if UPPER and trade_dt > UPPER:
+                    continue   # skip rows newer than to_date but keep paging
                 key = (chamber, row.get("office") or "", ticker, trade_dt, row.get("type") or "")
                 if key in seen:
                     continue

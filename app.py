@@ -98,7 +98,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year", "/api/political-trades/years"):
+    if request.path in ("/api/health", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year", "/api/political-trades/years", "/api/political-trades/months"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -1199,6 +1199,16 @@ def get_political_trade_years():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/political-trades/months")
+def get_political_trade_months():
+    """GET /api/political-trades/months — distinct YYYY-MM months in disc_date with row counts."""
+    try:
+        return jsonify(_db.get_political_trade_months())
+    except Exception as exc:
+        logger.error("political-trade-months error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/political-trades/backfill", methods=["POST"])
 def backfill_political_trades():
     """POST /api/political-trades/backfill — fetch recent trades, upsert."""
@@ -1247,13 +1257,14 @@ def backfill_political_trades_historical():
     all trades with trade_date >= from_date. Runs in background thread.
     """
     from_date = request.args.get("from_date", "2025-01-01")
+    to_date   = request.args.get("to_date") or None
     def _run():
-        logger.info("Historical political trades backfill started (from_date=%s)", from_date)
-        trades   = fetch_political_trades_historical(from_date=from_date)
+        logger.info("Historical political trades backfill started (from_date=%s, to_date=%s)", from_date, to_date)
+        trades   = fetch_political_trades_historical(from_date=from_date, to_date=to_date)
         inserted = _db.upsert_political_trades(trades)
         logger.info("Historical backfill done — %d fetched, %d new", len(trades), inserted)
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "historical_backfill_started", "from_date": from_date})
+    return jsonify({"status": "historical_backfill_started", "from_date": from_date, "to_date": to_date})
 
 
 @app.route("/api/political-trades/backfill-forward-prices", methods=["POST"])

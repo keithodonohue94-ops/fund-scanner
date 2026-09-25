@@ -715,6 +715,22 @@ def get_political_trades(tickers: set = None, since_date: str = None, limit: int
         session.close()
 
 
+def get_political_trade_months() -> dict:
+    """Return distinct YYYY-MM months present in disc_date, plus row count per month."""
+    from sqlalchemy import text as _text
+    session = _Session()
+    try:
+        rows = session.execute(_text(
+            "SELECT SUBSTRING(disc_date, 1, 7) AS ym, COUNT(*) AS cnt "
+            "FROM political_trades "
+            "WHERE disc_date IS NOT NULL AND disc_date != '' "
+            "GROUP BY ym ORDER BY ym ASC"
+        )).fetchall()
+        return {"disc_months": [{"month": r[0], "count": r[1]} for r in rows if r[0]]}
+    finally:
+        session.close()
+
+
 def get_political_trade_years() -> dict:
     """Return distinct years present in trade_date and disc_date columns."""
     from sqlalchemy import text as _text
