@@ -140,6 +140,7 @@ class EarningsSurprise(Base):
     ticker         = Column(String(20), nullable=False)
     fiscal_end     = Column(String(10), nullable=False)  # YYYY-MM-DD fiscal quarter end
     announced_date = Column(String(10))                   # YYYY-MM-DD actual report date
+    calendar_label = Column(String(10))                   # e.g. "Q2 '26" — quarter being reported ON
     is_upcoming    = Column(Boolean, default=False)        # True until company reports
 
     eps_actual     = Column(Float)
@@ -333,6 +334,8 @@ def init_db():
         "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS minus_di     FLOAT",
         "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS di_cross     VARCHAR(20)",
         "ALTER TABLE technicals_snapshot ADD COLUMN IF NOT EXISTS atr          FLOAT",
+        # earnings_surprises: calendar_label derived from announcement date (Sep 2026)
+        "ALTER TABLE earnings_surprises ADD COLUMN IF NOT EXISTS calendar_label VARCHAR(10)",
     ]
     for sql in _migrations:
         try:
@@ -778,10 +781,14 @@ def upsert_earnings(ticker: str, rows: list) -> int:
                 fiscal_end=fiscal_end,
             ).first()
 
+            ann_date = (row.get("date") or "")[:10]
+            label    = _announced_to_calendar_label(ann_date) if not is_upcoming else None
+
             if existing:
                 # Only update if: row was previously upcoming and now has actuals
                 if existing.is_upcoming and not is_upcoming:
-                    existing.announced_date = (row.get("date") or "")[:10]
+                    existing.announced_date = ann_date
+                    existing.calendar_label = label
                     existing.is_upcoming    = False
                     existing.eps_actual     = row.get("eps_actual")
                     existing.eps_est        = row.get("eps_est")
@@ -796,7 +803,8 @@ def upsert_earnings(ticker: str, rows: list) -> int:
                 session.add(EarningsSurprise(
                     ticker         = ticker.upper(),
                     fiscal_end     = fiscal_end,
-                    announced_date = (row.get("date") or "")[:10],
+                    announced_date = ann_date,
+                    calendar_label = label,
                     is_upcoming    = is_upcoming,
                     eps_actual     = row.get("eps_actual"),
                     eps_est        = row.get("eps_est"),
@@ -813,6 +821,42 @@ def upsert_earnings(ticker: str, rows: list) -> int:
     except Exception as exc:
         session.rollback()
         logger.error("upsert_earnings error %s: %s", ticker, exc)
+        raise
+    finally:
+        session.close()
+
+
+def backfill_calendar_labels() -> int:
+    """
+    One-time migration: for every EarningsSurprise row that has an announced_date
+    but no calendar_label, compute and set the label.
+    Safe to run multiple times (idempotent — skips rows that already have a label).
+    Returns number of rows updated.
+    """
+    session = _Session()
+    updated = 0
+    try:
+        rows = (
+            session.query(EarningsSurprise)
+            .filter(
+                EarningsSurprise.announced_date.isnot(None),
+                EarningsSurprise.announced_date != "",
+                EarningsSurprise.calendar_label.is_(None),
+                EarningsSurprise.is_upcoming == False,
+            )
+            .all()
+        )
+        for row in rows:
+            label = _announced_to_calendar_label(row.announced_date)
+            if label:
+                row.calendar_label = label
+                updated += 1
+        session.commit()
+        logger.info("backfill_calendar_labels: %d rows updated", updated)
+        return updated
+    except Exception as exc:
+        session.rollback()
+        logger.error("backfill_calendar_labels error: %s", exc)
         raise
     finally:
         session.close()
@@ -851,15 +895,16 @@ def get_earnings_db(tickers: list) -> dict:
             if r.ticker not in result:
                 result[r.ticker] = []
             result[r.ticker].append({
-                "date":        r.announced_date,
-                "fiscal_end":  r.fiscal_end,
-                "is_upcoming": r.is_upcoming,
-                "eps_actual":  r.eps_actual,
-                "eps_est":     r.eps_est,
-                "eps_surp":    r.eps_surp,
-                "rev_actual":  r.rev_actual,
-                "rev_est":     r.rev_est,
-                "rev_surp":    r.rev_surp,
+                "date":           r.announced_date,
+                "fiscal_end":     r.fiscal_end,
+                "calendar_label": r.calendar_label,
+                "is_upcoming":    r.is_upcoming,
+                "eps_actual":     r.eps_actual,
+                "eps_est":        r.eps_est,
+                "eps_surp":       r.eps_surp,
+                "rev_actual":     r.rev_actual,
+                "rev_est":        r.rev_est,
+                "rev_surp":       r.rev_surp,
             })
         return result
     finally:
@@ -878,10 +923,8 @@ def count_earnings() -> int:
 def get_stale_upcoming_tickers() -> list:
     """
     Return tickers that have upcoming rows whose fiscal_end has already passed by 14+ days.
-    These companies should have reported by now — re-fetch to pick up actuals.
+    Kept for backwards compatibility — main nightly flow now uses get_tickers_missing_recent_earnings().
     """
-    cutoff = datetime.utcnow().strftime("%Y-%m-%d")
-    # fiscal_end < today - 14 days means the quarter closed 2+ weeks ago
     from datetime import timedelta
     cutoff = (datetime.utcnow() - timedelta(days=14)).strftime("%Y-%m-%d")
     session = _Session()
@@ -896,6 +939,102 @@ def get_stale_upcoming_tickers() -> list:
             .all()
         )
         return [r[0] for r in rows]
+    finally:
+        session.close()
+
+
+def last_elapsed_quarter_end() -> str:
+    """
+    Return the most recent calendar quarter-end (Mar 31 / Jun 30 / Sep 30 / Dec 31)
+    that has passed, as YYYY-MM-DD.
+    """
+    from datetime import date as _date
+    today = datetime.utcnow().date()
+    candidates = []
+    for year in [today.year - 1, today.year]:
+        for mo, day in [(3, 31), (6, 30), (9, 30), (12, 31)]:
+            candidates.append(_date(year, mo, day))
+    elapsed = [d for d in candidates if d <= today]
+    return elapsed[-1].strftime("%Y-%m-%d")
+
+
+def _announced_to_calendar_label(announced_date: str) -> str | None:
+    """
+    Map an earnings announcement date to the calendar quarter label for the
+    period being reported ON (not the reporting window itself).
+
+    Reporting windows:
+      Q1 window (Jan-Mar) → companies reporting on Q4 of prior year  → "Q4 'YY-1"
+      Q2 window (Apr-Jun) → companies reporting on Q1                → "Q1 'YY"
+      Q3 window (Jul-Sep) → companies reporting on Q2                → "Q2 'YY"
+      Q4 window (Oct-Dec) → companies reporting on Q3                → "Q3 'YY"
+    """
+    if not announced_date:
+        return None
+    try:
+        from datetime import date as _date
+        d = _date.fromisoformat(announced_date[:10])
+        y, m = d.year, d.month
+        if m <= 3:
+            return f"Q4 '{(y - 1) % 100:02d}"   # Jan-Mar 2026 → "Q4 '25"
+        elif m <= 6:
+            return f"Q1 '{y % 100:02d}"           # Apr-Jun 2026 → "Q1 '26"
+        elif m <= 9:
+            return f"Q2 '{y % 100:02d}"           # Jul-Sep 2026 → "Q2 '26"
+        else:
+            return f"Q3 '{y % 100:02d}"           # Oct-Dec 2026 → "Q3 '26"
+    except Exception:
+        return None
+
+
+def current_target_label() -> str:
+    """
+    Return the calendar_label that universe companies are expected to have
+    persisted by now (i.e. the label for the reporting window that just closed).
+
+    Derived from last_elapsed_quarter_end():
+      Mar 31 elapsed → Q1 window closed → companies reported Q4 prior year → "Q4 'YY-1"
+      Jun 30 elapsed → Q2 window closed → companies reported Q1            → "Q1 'YY"
+      Sep 30 elapsed → Q3 window closed → companies reported Q2            → "Q2 'YY"
+      Dec 31 elapsed → Q4 window closed → companies reported Q3            → "Q3 'YY"
+    """
+    qe = last_elapsed_quarter_end()
+    from datetime import date as _date
+    d = _date.fromisoformat(qe)
+    y, m = d.year, d.month
+    if m == 3:
+        return f"Q4 '{(y - 1) % 100:02d}"
+    elif m == 6:
+        return f"Q1 '{y % 100:02d}"
+    elif m == 9:
+        return f"Q2 '{y % 100:02d}"
+    else:
+        return f"Q3 '{y % 100:02d}"
+
+
+def get_tickers_missing_recent_earnings(universe_tickers: list) -> list:
+    """
+    Return tickers that don't yet have a confirmed (is_upcoming=False) earnings row
+    with calendar_label matching the current target label.
+
+    Example: today is Sep 30 2026 → target = "Q2 '26"
+    Any ticker without a "Q2 '26" record needs to be fetched from FMP.
+    Once fetched and persisted with calendar_label="Q2 '26" it drops off nightly runs.
+    """
+    if not universe_tickers:
+        return []
+    target = current_target_label()
+    session = _Session()
+    try:
+        upper_tickers = [t.upper() for t in universe_tickers]
+        # Tickers that already have the target label confirmed
+        have = {r[0] for r in session.query(EarningsSurprise.ticker)
+                .filter(
+                    EarningsSurprise.ticker.in_(upper_tickers),
+                    EarningsSurprise.calendar_label == target,
+                    EarningsSurprise.is_upcoming == False,
+                ).distinct().all()}
+        return sorted({t.upper() for t in universe_tickers} - have)
     finally:
         session.close()
 

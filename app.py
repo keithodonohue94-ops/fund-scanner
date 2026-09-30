@@ -98,7 +98,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/ticker-sectors", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year", "/api/political-trades/years", "/api/political-trades/months"):
+    if request.path in ("/api/health", "/api/ticker-sectors", "/api/earnings/catchup", "/api/earnings/backfill-labels", "/api/political-trades/debug", "/api/political-trades/clear", "/api/political-trades/backfill-sectors", "/api/political-trades/backfill-prices", "/api/political-trades/refresh-last-prices", "/api/political-trades/backfill-historical", "/api/political-trades/backfill-forward-prices", "/api/political-trades/reset-prices", "/api/political-trades/backfill-year", "/api/political-trades/years", "/api/political-trades/months"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -814,17 +814,18 @@ def _background_scheduler():
             time.sleep(15)
         logger.info("EOD scan complete.")
 
-        # ── Earnings: today's reporters + stale upcoming ──────────────────────
+        # ── Earnings: fetch any ticker missing data for the last elapsed quarter ──
         todays_reporters = set()
         try:
-            todays   = _db.get_todays_reporters()
-            todays_reporters = todays  # save for EPS snapshot update below
-            stale    = set(_db.get_stale_upcoming_tickers())
-            to_fetch = sorted(todays | stale)
+            all_tkrs  = sorted(_all_tickers())
+            to_fetch  = _db.get_tickers_missing_recent_earnings(all_tkrs)
+            cutoff    = _db.last_elapsed_quarter_end()
             if to_fetch:
+                logger.info("Earnings nightly: %d tickers missing data since %s", len(to_fetch), cutoff)
                 _fetch_and_persist_earnings(to_fetch, label="nightly")
+                todays_reporters = set(to_fetch)  # re-fetch fundamentals snapshot for these
             else:
-                logger.info("No earnings reporters today and no stale upcoming tickers.")
+                logger.info("Earnings nightly: all tickers current through %s", cutoff)
         except Exception as exc:
             logger.error("Nightly earnings fetch error: %s", exc)
 
@@ -1030,6 +1031,37 @@ def get_price_targets():
 
 
 # ── Earnings tracker ──────────────────────────────────────────────────────────
+
+@app.route("/api/earnings/catchup", methods=["POST"])
+def earnings_catchup():
+    """
+    POST /api/earnings/catchup
+    One-time (or on-demand) catch-up: find all universe tickers missing earnings
+    for the last elapsed calendar quarter and fetch from FMP in a background thread.
+    """
+    def _run():
+        all_tkrs = sorted(_all_tickers())
+        to_fetch = _db.get_tickers_missing_recent_earnings(all_tkrs)
+        cutoff   = _db.last_elapsed_quarter_end()
+        logger.info("Earnings catch-up: %d tickers missing data since %s", len(to_fetch), cutoff)
+        _fetch_and_persist_earnings(to_fetch, label="catchup")
+        logger.info("Earnings catch-up complete.")
+    threading.Thread(target=_run, daemon=True).start()
+    target_label  = _db.current_target_label()
+    missing_count = len(_db.get_tickers_missing_recent_earnings(sorted(_all_tickers())))
+    return jsonify({"status": "started", "target_label": target_label, "tickers_to_fetch": missing_count})
+
+
+@app.route("/api/earnings/backfill-labels", methods=["POST"])
+def earnings_backfill_labels():
+    """
+    POST /api/earnings/backfill-labels
+    One-time migration: populate calendar_label on all existing earnings rows that
+    have an announced_date but no label yet. Safe to run multiple times (idempotent).
+    """
+    updated = _db.backfill_calendar_labels()
+    return jsonify({"status": "done", "rows_updated": updated})
+
 
 @app.route("/api/earnings-raw")
 def get_earnings_raw():
