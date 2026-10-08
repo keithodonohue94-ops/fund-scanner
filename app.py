@@ -814,14 +814,22 @@ def _background_scheduler():
             time.sleep(15)
         logger.info("EOD scan complete.")
 
-        # ── Earnings: fetch any ticker missing data for the last elapsed quarter ──
+        # ── Earnings: report-day + overdue actuals + last-quarter backstop ─────
+        #   1. pending  — report date has arrived but EPS/revenue actual still
+        #                 null (retried nightly until FMP posts both numbers)
+        #   2. calendar — tickers on today's report_calendar
+        #   3. missing  — no complete row for the last elapsed quarter
         todays_reporters = set()
         try:
-            all_tkrs  = sorted(_all_tickers())
-            to_fetch  = _db.get_tickers_missing_recent_earnings(all_tkrs)
+            all_tkrs  = set(_all_tickers())
+            pending   = set(_db.get_tickers_pending_actuals()) & all_tkrs
+            calendar  = set(_db.get_todays_reporters()) & all_tkrs
+            missing   = set(_db.get_tickers_missing_recent_earnings(sorted(all_tkrs)))
+            to_fetch  = sorted(pending | calendar | missing)
             cutoff    = _db.last_elapsed_quarter_end()
             if to_fetch:
-                logger.info("Earnings nightly: %d tickers missing data since %s", len(to_fetch), cutoff)
+                logger.info("Earnings nightly: %d tickers (pending=%d, calendar=%d, missing since %s=%d)",
+                            len(to_fetch), len(pending), len(calendar), cutoff, len(missing))
                 _fetch_and_persist_earnings(to_fetch, label="nightly")
                 todays_reporters = set(to_fetch)  # re-fetch fundamentals snapshot for these
             else:
@@ -1039,17 +1047,24 @@ def earnings_catchup():
     One-time (or on-demand) catch-up: find all universe tickers missing earnings
     for the last elapsed calendar quarter and fetch from FMP in a background thread.
     """
+    all_tkrs = set(_all_tickers())
+    pending  = set(_db.get_tickers_pending_actuals()) & all_tkrs
+    missing  = set(_db.get_tickers_missing_recent_earnings(sorted(all_tkrs)))
+    to_fetch = sorted(pending | missing)
+
     def _run():
-        all_tkrs = sorted(_all_tickers())
-        to_fetch = _db.get_tickers_missing_recent_earnings(all_tkrs)
-        cutoff   = _db.last_elapsed_quarter_end()
-        logger.info("Earnings catch-up: %d tickers missing data since %s", len(to_fetch), cutoff)
+        cutoff = _db.last_elapsed_quarter_end()
+        logger.info("Earnings catch-up: %d tickers (pending=%d, missing since %s=%d)",
+                    len(to_fetch), len(pending), cutoff, len(missing))
         _fetch_and_persist_earnings(to_fetch, label="catchup")
         logger.info("Earnings catch-up complete.")
     threading.Thread(target=_run, daemon=True).start()
-    target_label  = _db.current_target_label()
-    missing_count = len(_db.get_tickers_missing_recent_earnings(sorted(_all_tickers())))
-    return jsonify({"status": "started", "target_label": target_label, "tickers_to_fetch": missing_count})
+    return jsonify({
+        "status":           "started",
+        "target_label":     _db.current_target_label(),
+        "tickers_to_fetch": len(to_fetch),
+        "pending":          sorted(pending),
+    })
 
 
 @app.route("/api/earnings/backfill-labels", methods=["POST"])

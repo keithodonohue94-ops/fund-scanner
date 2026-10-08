@@ -785,11 +785,18 @@ def upsert_earnings(ticker: str, rows: list) -> int:
             label    = _announced_to_calendar_label(ann_date) if not is_upcoming else None
 
             if existing:
-                # Only update if: row was previously upcoming and now has actuals
-                if existing.is_upcoming and not is_upcoming:
-                    existing.announced_date = ann_date
+                # A row is final only once BOTH actuals are stored. Until then
+                # (still upcoming, or past its report date with null actuals)
+                # refresh it from FMP on every fetch.
+                pending = (
+                    existing.is_upcoming
+                    or existing.eps_actual is None
+                    or existing.rev_actual is None
+                )
+                if pending:
+                    existing.announced_date = ann_date or existing.announced_date
                     existing.calendar_label = label
-                    existing.is_upcoming    = False
+                    existing.is_upcoming    = is_upcoming
                     existing.eps_actual     = row.get("eps_actual")
                     existing.eps_est        = row.get("eps_est")
                     existing.eps_surp       = row.get("eps_surp")
@@ -797,8 +804,9 @@ def upsert_earnings(ticker: str, rows: list) -> int:
                     existing.rev_est        = row.get("rev_est")
                     existing.rev_surp       = row.get("rev_surp")
                     existing.fetched_at     = datetime.utcnow()
-                    updated += 1
-                # Confirmed actuals are left untouched
+                    if not is_upcoming:
+                        updated += 1
+                # Final rows (both actuals stored) are never overwritten
             else:
                 session.add(EarningsSurprise(
                     ticker         = ticker.upper(),
@@ -1033,8 +1041,41 @@ def get_tickers_missing_recent_earnings(universe_tickers: list) -> list:
                     EarningsSurprise.ticker.in_(upper_tickers),
                     EarningsSurprise.calendar_label == target,
                     EarningsSurprise.is_upcoming == False,
+                    EarningsSurprise.eps_actual.isnot(None),
+                    EarningsSurprise.rev_actual.isnot(None),
                 ).distinct().all()}
         return sorted({t.upper() for t in universe_tickers} - have)
+    finally:
+        session.close()
+
+
+def get_tickers_pending_actuals() -> list:
+    """
+    Return tickers with any earnings row whose report date has arrived
+    (announced_date <= today) but whose EPS or revenue actual is still null.
+    These are re-fetched every night until FMP returns both numbers.
+    Covers report-day fetches (row is upcoming with today's date) and rows
+    previously saved with null actuals.
+    """
+    from sqlalchemy import or_
+    today = date.today().strftime("%Y-%m-%d")
+    session = _Session()
+    try:
+        rows = (
+            session.query(EarningsSurprise.ticker)
+            .filter(
+                EarningsSurprise.announced_date.isnot(None),
+                EarningsSurprise.announced_date != "",
+                EarningsSurprise.announced_date <= today,
+                or_(
+                    EarningsSurprise.eps_actual.is_(None),
+                    EarningsSurprise.rev_actual.is_(None),
+                ),
+            )
+            .distinct()
+            .all()
+        )
+        return sorted(r[0] for r in rows)
     finally:
         session.close()
 

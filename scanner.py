@@ -380,7 +380,6 @@ def _fetch_earnings_surprises(symbol: str, limit: int = 8) -> list:
             "revenue", "revenueEstimated", "actualRevenue", "revenueActual",
         )})
         date_str = row.get("date", "")
-        is_upcoming = bool(date_str) and date_str > today_str
 
         actual = _pick(row, "epsActual", "eps", "actualEps", "actualEarningResult")
         est    = _pick(row, "epsEstimated", "estimatedEps", "estimatedEarning")
@@ -392,6 +391,14 @@ def _fetch_earnings_surprises(symbol: str, limit: int = 8) -> list:
         rev_surp   = None
         if rev_actual is not None and rev_est is not None and rev_est != 0:
             rev_surp = round((rev_actual - rev_est) / abs(rev_est) * 100, 1)
+        # A quarter only counts as reported once FMP has BOTH actuals.
+        # Report date passed but actuals still null (e.g. after-close reporter
+        # fetched before FMP posted) → keep it upcoming so it is retried.
+        is_upcoming = (
+            (bool(date_str) and date_str > today_str)
+            or actual is None
+            or rev_actual is None
+        )
         fiscal_end = row.get("fiscalDateEnding") or row.get("fiscal_date_ending") or date_str
         result.append({
             "date":        date_str,    # announcement date — used for upcoming display
