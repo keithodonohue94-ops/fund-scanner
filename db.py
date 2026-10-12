@@ -297,6 +297,36 @@ class ReportCalendar(Base):
     )
 
 
+
+class IVHistory(Base):
+    """
+    Daily at-the-money implied volatility per ticker (one row per ticker per day),
+    written by the nightly wing scan for EVERY ticker whose chain loads, whether or
+    not a skew signal fired. atm_iv_30d is a constant-maturity 30-day ATM IV,
+    interpolated in total variance between the expiries bracketing 30 DTE.
+    Builds the history needed for IV rank / IV percentile. IVs stored as % (35.0 = 35%).
+    """
+    __tablename__ = "iv_history"
+
+    id            = Column(Integer, primary_key=True)
+    snapshot_date = Column(Date,       nullable=False)
+    ticker        = Column(String(20), nullable=False)
+    spot          = Column(Float)
+    atm_iv_30d    = Column(Float)        # constant-maturity 30-day ATM IV (%)
+    near_expiry   = Column(String(10))   # expiry at/below 30 DTE used for interpolation
+    near_dte      = Column(Integer)
+    near_iv       = Column(Float)        # ATM IV (%) of near expiry
+    far_expiry    = Column(String(10))   # expiry at/above 30 DTE
+    far_dte       = Column(Integer)
+    far_iv        = Column(Float)
+    method        = Column(String(12))   # 'interp' | 'exact' | 'near_only' | 'far_only'
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_date", "ticker", name="uq_iv_hist"),
+        Index("ix_iv_hist_ticker", "ticker", "snapshot_date"),
+    )
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def init_db():
@@ -641,6 +671,56 @@ def get_wing_snapshot(universe: str, bias: str = None) -> list:
     finally:
         session.close()
 
+
+
+def save_iv_snapshot(rows: list) -> int:
+    """Upsert today's ATM IV rows (one per ticker). Returns rows written."""
+    if not rows:
+        return 0
+    today = date.today()
+    cols = ("spot", "atm_iv_30d", "near_expiry", "near_dte", "near_iv",
+            "far_expiry", "far_dte", "far_iv", "method")
+    session = _Session()
+    written = 0
+    try:
+        for row in rows:
+            ticker = (row.get("ticker") or "").upper()
+            if not ticker or row.get("atm_iv_30d") is None:
+                continue
+            existing = session.query(IVHistory).filter_by(snapshot_date=today, ticker=ticker).first()
+            if existing:
+                for k in cols:
+                    setattr(existing, k, row.get(k))
+            else:
+                session.add(IVHistory(snapshot_date=today, ticker=ticker, **{k: row.get(k) for k in cols}))
+            written += 1
+        session.commit()
+        logger.info("save_iv_snapshot: %d tickers written for %s", written, today)
+        return written
+    except Exception as exc:
+        session.rollback()
+        logger.error("save_iv_snapshot error: %s", exc)
+        return 0
+    finally:
+        session.close()
+
+
+def get_iv_history(ticker: str, days: int = 365) -> list:
+    """Return [{date, atm_iv_30d, spot}] for a ticker over the last N calendar days, oldest first."""
+    from datetime import timedelta
+    since = date.today() - timedelta(days=days)
+    session = _Session()
+    try:
+        rows = (
+            session.query(IVHistory)
+            .filter(IVHistory.ticker == ticker.upper(), IVHistory.snapshot_date >= since)
+            .order_by(IVHistory.snapshot_date)
+            .all()
+        )
+        return [{"date": r.snapshot_date.isoformat(), "atm_iv_30d": r.atm_iv_30d, "spot": r.spot}
+                for r in rows]
+    finally:
+        session.close()
 
 # ── Political trades functions ────────────────────────────────────────────────
 

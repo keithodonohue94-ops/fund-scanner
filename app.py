@@ -512,9 +512,76 @@ def _fetch_technicals_for_ticker(ticker: str, tradier_key: str) -> dict | None:
         return None
 
 
+def _opt_mid_iv(opt):
+    """IV (decimal) from a Tradier option's greeks, with the same fallback order as the wing scan."""
+    if not opt:
+        return None
+    g = opt.get("greeks") or {}
+    iv = g.get("mid_iv") or g.get("smv_vol") or g.get("ask_iv") or opt.get("implied_volatility")
+    try:
+        iv = float(iv) if iv is not None else None
+    except (TypeError, ValueError):
+        return None
+    return iv if iv and iv > 0 else None
+
+
+def _atm_iv_from_chain(chain: list, spot: float):
+    """
+    ATM IV (decimal) for one expiry: the strike nearest spot, averaging the put and
+    call IV at that strike (whichever are available). Returns None if neither has IV.
+    """
+    by_strike = {}
+    for opt in chain or []:
+        s = opt.get("strike")
+        if s is None:
+            continue
+        by_strike.setdefault(float(s), {})[opt.get("option_type")] = opt
+    if not by_strike:
+        return None
+    atm = min(by_strike, key=lambda k: abs(k - spot))
+    ivs = [iv for iv in (_opt_mid_iv(by_strike[atm].get("put")),
+                         _opt_mid_iv(by_strike[atm].get("call"))) if iv is not None]
+    return sum(ivs) / len(ivs) if ivs else None
+
+
+def _constant_maturity_iv(points: list, target_dte: int = 30) -> dict:
+    """
+    points: [(dte, expiry, atm_iv_decimal)]. Interpolates ATM IV to target_dte in
+    total variance (iv^2 * t) between the expiries bracketing it; falls back to the
+    nearest side when only one side exists. Returns {} if no usable points.
+    """
+    import math
+    pts = sorted((d, e, iv) for d, e, iv in points if d and d >= 1 and iv)
+    if not pts:
+        return {}
+    near = [p for p in pts if p[0] <= target_dte]
+    far  = [p for p in pts if p[0] >= target_dte]
+    n = near[-1] if near else None
+    f = far[0]   if far  else None
+    out = {}
+    if n and f and n[0] != f[0]:
+        v1, v2 = n[2] ** 2 * n[0], f[2] ** 2 * f[0]
+        w = (target_dte - n[0]) / (f[0] - n[0])
+        iv = math.sqrt(max(v1 + w * (v2 - v1), 0) / target_dte)
+        method = "interp"
+    elif n and f:
+        iv, method = n[2], "exact"
+    elif f:
+        iv, method = f[2], "far_only"
+    else:
+        iv, method = n[2], "near_only"
+    if n:
+        out.update(near_expiry=str(n[1]), near_dte=n[0], near_iv=round(n[2] * 100, 4))
+    if f:
+        out.update(far_expiry=str(f[1]), far_dte=f[0], far_iv=round(f[2] * 100, 4))
+    out.update(atm_iv_30d=round(iv * 100, 4), method=method)
+    return out
+
+
 def _wing_scan_ticker(ticker: str, tradier_key: str,
                       min_otm: float = 0.20, min_iv_diff: float = 0.05,
-                      min_vol: int = 50, min_oi: int = 100) -> list:
+                      min_vol: int = 50, min_oi: int = 100,
+                      atm_out: dict = None) -> list:
     """
     Scan Tradier options chain for equidistant OTM put/call pairs with confirmed IV skew bias.
     Mirrors the frontend Wing Scanner Web Worker logic exactly.
@@ -530,6 +597,10 @@ def _wing_scan_ticker(ticker: str, tradier_key: str,
       call bias: iv_diff > 0  AND call_oi > put_oi  AND pcr < 1
 
     Returns list of pair dicts (may be empty). IVs stored as % (e.g. 35.0 = 35%).
+
+    atm_out: optional dict. If given, it is filled with this ticker's constant-maturity
+    30-day ATM IV (see _constant_maturity_iv) plus spot, computed from the same chains,
+    regardless of whether any skew pair qualifies. Used for the daily iv_history table.
     """
     import requests as _req
 
@@ -569,6 +640,7 @@ def _wing_scan_ticker(ticker: str, tradier_key: str,
         spot = float(spot)
 
         pairs = []
+        atm_points = []   # (dte, expiry, atm_iv_decimal) for the daily ATM IV snapshot
 
         # 3 — Per-expiration chain scan
         for expiry in expirations:
@@ -585,6 +657,13 @@ def _wing_scan_ticker(ticker: str, tradier_key: str,
                 chain = r3.json().get("options", {}).get("option", [])
                 if not chain:
                     continue
+                if isinstance(chain, dict):
+                    chain = [chain]
+
+                if atm_out is not None:
+                    _atm = _atm_iv_from_chain(chain, spot)
+                    if _atm:
+                        atm_points.append((dte, str(expiry), _atm))
 
                 puts_by_strike  = {}
                 calls_by_strike = {}
@@ -684,6 +763,32 @@ def _wing_scan_ticker(ticker: str, tradier_key: str,
                 logger.warning("wing scan %s expiry %s: %s", ticker, expiry, exp_exc)
                 continue
 
+        if atm_out is not None:
+            try:
+                # The wing scan only looks at current-year expiries; late in the year
+                # none may reach 30 DTE, so fetch the first expiry beyond it for ATM IV.
+                if not any(d >= 30 for d, _, _ in atm_points):
+                    beyond = sorted(e for e in exp_raw
+                                    if str(e) not in expirations
+                                    and (date.fromisoformat(str(e)) - today_dt).days >= 30)
+                    if beyond:
+                        e = beyond[0]
+                        r4 = _req.get(f"{base}/options/chains",
+                                      params={"symbol": ticker, "expiration": e, "greeks": "true"},
+                                      headers=hdrs, timeout=20)
+                        if r4.ok:
+                            ch = r4.json().get("options", {}).get("option", []) or []
+                            if isinstance(ch, dict):
+                                ch = [ch]
+                            _atm = _atm_iv_from_chain(ch, spot)
+                            if _atm:
+                                atm_points.append(((date.fromisoformat(str(e)) - today_dt).days, str(e), _atm))
+                cm = _constant_maturity_iv(atm_points, 30)
+                if cm:
+                    atm_out.update(cm, ticker=ticker, spot=round(spot, 4))
+            except Exception as atm_exc:
+                logger.warning("ATM IV snapshot %s: %s", ticker, atm_exc)
+
         return pairs
 
     except Exception as exc:
@@ -753,8 +858,12 @@ def _run_wing_eod():
     total_pairs   = 0
 
     logger.info("_run_wing_eod: scanning %d tickers via Tradier", len(all_tkrs))
+    iv_rows = []   # one ATM IV row per ticker for the iv_history table
     for ticker in all_tkrs:
-        pairs = _wing_scan_ticker(ticker, tradier_key)
+        atm = {}
+        pairs = _wing_scan_ticker(ticker, tradier_key, atm_out=atm)
+        if atm.get("atm_iv_30d") is not None:
+            iv_rows.append(atm)
         if pairs:
             total_pairs += len(pairs)
             for ukey, tlist in universes_now.items():
@@ -765,6 +874,9 @@ def _run_wing_eod():
     for ukey, rows in results_by_u.items():
         if rows:
             _db.save_wing_snapshot(ukey, rows)
+
+    iv_written = _db.save_iv_snapshot(iv_rows)
+    logger.info("_run_wing_eod: ATM IV saved for %d of %d tickers", iv_written, len(all_tkrs))
 
     logger.info("_run_wing_eod complete — %d pairs found, %d universes written",
                 total_pairs, sum(1 for r in results_by_u.values() if r))
@@ -1149,6 +1261,37 @@ def get_earnings():
                     results[sym] = upcoming_rows + confirmed
 
     resp = jsonify({"results": results, "count": len(results)})
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
+
+
+@app.route("/api/iv-history")
+def get_iv_history():
+    """
+    GET /api/iv-history?ticker=NVDA&days=365
+    Daily 30-day ATM IV history plus IV rank / percentile of the latest reading.
+    rank and percentile are null until at least 20 days of history exist.
+    """
+    ticker = (request.args.get("ticker") or "").upper().strip()
+    if not ticker:
+        return jsonify({"error": "ticker required"}), 400
+    try:
+        days = max(1, min(int(request.args.get("days", 365)), 1825))
+    except ValueError:
+        days = 365
+    hist = _db.get_iv_history(ticker, days)
+    ivs  = [h["atm_iv_30d"] for h in hist if h["atm_iv_30d"] is not None]
+    rank = pct = None
+    if len(ivs) >= 20:
+        cur, lo, hi = ivs[-1], min(ivs), max(ivs)
+        rank = round((cur - lo) / (hi - lo) * 100, 1) if hi > lo else None
+        pct  = round(sum(1 for v in ivs[:-1] if v < cur) / (len(ivs) - 1) * 100, 1)
+    resp = jsonify({
+        "ticker": ticker, "days": days, "n_days": len(ivs),
+        "current": ivs[-1] if ivs else None,
+        "iv_rank": rank, "iv_percentile": pct,
+        "history": hist,
+    })
     resp.headers['Cache-Control'] = 'public, max-age=86400'
     return resp
 
