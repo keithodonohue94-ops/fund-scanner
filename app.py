@@ -882,46 +882,28 @@ def _run_wing_eod():
                 total_pairs, sum(1 for r in results_by_u.values() if r))
 
 
-def _background_scheduler():
-    """
-    On startup:
-      1. Warm portfolio cache.
-      2. Refresh earnings calendar for the next 3 weeks.
-      3. If earnings_surprises table is empty → backfill all tickers (background thread).
+# ── Scheduled jobs ─────────────────────────────────────────────────────────────
+# The tabs keep scanning live; this job runs the same live scans once each weekday after the close
+# and persists the results (fundamentals_snapshot, technicals_snapshot, wing_snapshot, earnings,
+# political trades) so every day's live view is stored. APScheduler (not a sleep loop) so it survives
+# restarts, is DST-aware, and one failing step can't kill the others.
+from apscheduler.schedulers.background import BackgroundScheduler
 
-    Then at 4:00 PM Eastern every weekday:
-      - Run EOD fundamentals scan (all universes, save to DB).
-      - Fetch & persist earnings for today's reporters + any stale upcoming tickers.
-      - Refresh political trades.
+_EOD_STATE = {"running": False, "stage": None, "started": None, "finished": None, "error": None, "last_ok": None}
+_eod_lock = threading.Lock()
 
-    Every Sunday after the EOD window:
-      - Refresh earnings calendar for the next 3 weeks.
-    """
-    time.sleep(5)  # let gunicorn finish booting
 
-    # ── Startup ───────────────────────────────────────────────────────────────
-    _run_scan("portfolio")
-    logger.info("Startup scan done.")
-
-    # Calendar refresh on every startup
-    _refresh_earnings_calendar()
-
-    # Backfill earnings if table is empty
-    if _db.count_earnings() == 0:
-        logger.info("Earnings table empty — launching backfill thread")
-        threading.Thread(target=_earnings_backfill, daemon=True).start()
-    else:
-        logger.info("Earnings table has data — skipping backfill")
-
-    logger.info("Startup complete. Waiting for next 4pm ET window.")
-
-    # ── Nightly loop ──────────────────────────────────────────────────────────
-    while True:
-        time.sleep(_next_4pm_eastern())
-
+def _eod_job():
+    if not _eod_lock.acquire(blocking=False):
+        logger.info("EOD job already running — skipping")
+        return
+    _EOD_STATE.update(running=True, started=_now(), finished=None, error=None, stage="starting")
+    try:
         # ── EOD fundamentals scan ─────────────────────────────────────────────
-        logger.info("4pm ET — starting EOD scan (%d universes)", len(SCAN_ORDER))
-        for ukey in SCAN_ORDER:
+        _eod_universes = list(dict.fromkeys(SCAN_ORDER + list(_load_universes_from_db().keys())))
+        logger.info("EOD — starting fundamentals scan (%d universes)", len(_eod_universes))
+        for ukey in _eod_universes:
+            _EOD_STATE["stage"] = f"fundamentals:{ukey}"
             _run_scan(ukey, save_to_db=True)
             time.sleep(15)
         logger.info("EOD scan complete.")
@@ -995,11 +977,69 @@ def _background_scheduler():
         except Exception as exc:
             logger.error("Wing scanner EOD error: %s", exc)
 
-        # ── Weekly Sunday: refresh earnings calendar ──────────────────────────
-        if date.today().weekday() == 6:  # 6 = Sunday
-            _refresh_earnings_calendar()
 
+        _EOD_STATE["stage"] = "cloudflare purge"
         _purge_cloudflare_cache()
+        _EOD_STATE["last_ok"] = _now()
+    except Exception as exc:
+        logger.exception("EOD job failed")
+        _EOD_STATE["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        _EOD_STATE.update(running=False, finished=_now(), stage=None)
+        _eod_lock.release()
+
+
+def _startup_tasks():
+    """Warm caches on boot. Each step is isolated so one failure can't stop the rest."""
+    time.sleep(5)  # let gunicorn finish booting
+    for name, fn in (("portfolio scan", lambda: _run_scan("portfolio")),
+                     ("earnings calendar", _refresh_earnings_calendar)):
+        try:
+            fn()
+        except Exception as exc:
+            logger.error("Startup %s failed: %s", name, exc)
+    try:
+        if _db.count_earnings() == 0:
+            logger.info("Earnings table empty — launching backfill thread")
+            threading.Thread(target=_earnings_backfill, daemon=True).start()
+    except Exception as exc:
+        logger.error("Startup earnings check failed: %s", exc)
+    # Catch-up: if the service was down at the scheduled time, run today's EOD once now
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.weekday() < 5 and (now_et.hour, now_et.minute) >= (16, 20) and not _db.has_snapshot_for(now_et.date()):
+            logger.info("Startup catch-up: no fundamentals snapshot for %s — running EOD now", now_et.date())
+            _eod_job()
+    except Exception as exc:
+        logger.error("Startup catch-up check failed: %s", exc)
+    logger.info("Startup complete.")
+
+
+_scheduler = BackgroundScheduler(timezone="America/New_York")
+_scheduler.add_job(_eod_job, "cron", day_of_week="mon-fri", hour=16, minute=20, id="eod",
+                   misfire_grace_time=6 * 3600, coalesce=True, max_instances=1)
+_scheduler.add_job(_refresh_earnings_calendar, "cron", day_of_week="sun", hour=18, minute=0, id="calendar",
+                   misfire_grace_time=6 * 3600, coalesce=True)
+
+
+@app.route("/api/eod-status")
+def eod_status():
+    """Is the nightly persistence running, and what did it save today?"""
+    try:
+        today_rows = _db.snapshot_counts_for(date.today())
+    except Exception as exc:
+        today_rows = {"error": str(exc)}
+    jobs = [{"id": j.id, "next_run": j.next_run_time.isoformat() if j.next_run_time else None} for j in _scheduler.get_jobs()]
+    return jsonify({**_EOD_STATE, "jobs": jobs, "fundamentals_saved_today": today_rows})
+
+
+@app.route("/api/eod-run", methods=["POST"])
+def eod_run():
+    if _EOD_STATE["running"]:
+        return jsonify({"status": "already running", **_EOD_STATE})
+    threading.Thread(target=_eod_job, daemon=True).start()
+    return jsonify({"status": "started"})
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
@@ -1727,7 +1767,8 @@ def _now():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 # Start background scheduler when module loads (works with gunicorn too)
-_bg_thread = threading.Thread(target=_background_scheduler, daemon=True)
+_bg_thread = threading.Thread(target=_startup_tasks, daemon=True)
+_scheduler.start()
 _bg_thread.start()
 
 if __name__ == "__main__":

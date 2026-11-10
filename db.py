@@ -505,6 +505,28 @@ def get_ticker_list(universe: str | None = None) -> list:
 
 
 
+def has_snapshot_for(day) -> bool:
+    """True if any fundamentals snapshot row exists for that date."""
+    session = _Session()
+    try:
+        return session.query(FundamentalsSnapshot.id).filter(FundamentalsSnapshot.snapshot_date == day).first() is not None
+    finally:
+        session.close()
+
+
+def snapshot_counts_for(day) -> dict:
+    """{universe: rows saved} for that date — used by /api/eod-status."""
+    from sqlalchemy import func
+    session = _Session()
+    try:
+        rows = (session.query(FundamentalsSnapshot.universe, func.count(FundamentalsSnapshot.id))
+                .filter(FundamentalsSnapshot.snapshot_date == day)
+                .group_by(FundamentalsSnapshot.universe).all())
+        return {u: n for u, n in rows}
+    finally:
+        session.close()
+
+
 def get_fundamentals_snapshot(universe: str) -> list:
     """Return the latest snapshot for all tickers in a given universe."""
     session = _Session()
