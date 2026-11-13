@@ -578,222 +578,87 @@ def _constant_maturity_iv(points: list, target_dte: int = 30) -> dict:
     return out
 
 
-def _wing_scan_ticker(ticker: str, tradier_key: str,
-                      min_otm: float = 0.20, min_iv_diff: float = 0.05,
-                      min_vol: int = 50, min_oi: int = 100,
-                      atm_out: dict = None) -> list:
+def _wing_scan_ticker(ticker: str, tradier_key: str, atm_out: dict = None, params: dict = None,
+                      today: date = None) -> list:
     """
-    Scan Tradier options chain for equidistant OTM put/call pairs with confirmed IV skew bias.
-    Mirrors the frontend Wing Scanner Web Worker logic exactly.
+    Options-skew scan for one ticker via Tradier. Pair selection lives in wing.py — an exact, parity-tested
+    port of the Options Skew tab's original browser scan (see wing.py for the rules).
 
-    Filters applied (matching UI defaults):
-      - min_otm     = 0.20  (put must be ≥20% below spot)
-      - min_iv_diff = 0.05  (|put_iv - call_iv| ≥ 5 percentage points, in decimal)
-      - min_vol     = 50    (both legs must have ≥50 volume)
-      - min_oi      = 100   (both legs must have ≥100 open interest)
-
-    Bias confirmation (must pass to be included):
-      put  bias: iv_diff < 0  AND put_oi  > call_oi AND pcr > 1
-      call bias: iv_diff > 0  AND call_oi > put_oi  AND pcr < 1
-
-    Returns list of pair dicts (may be empty). IVs stored as % (e.g. 35.0 = 35%).
-
-    atm_out: optional dict. If given, it is filled with this ticker's constant-maturity
-    30-day ATM IV (see _constant_maturity_iv) plus spot, computed from the same chains,
-    regardless of whether any skew pair qualifies. Used for the daily iv_history table.
+    atm_out: optional dict, filled with this ticker's constant-maturity 30-day ATM IV (iv_history table)
+    from the same chains, whether or not any pair qualifies.
     """
     import requests as _req
+    import wing as W
 
+    p = {**W.DEFAULTS, **(params or {})}
     base = "https://api.tradier.com/v1/markets"
     hdrs = {"Authorization": f"Bearer {tradier_key}", "Accept": "application/json"}
-    current_year = str(date.today().year)
-    today_dt     = date.today()
+    today_dt = today or _ny_today()
+
+    def get(path, **params_):
+        r = _req.get(f"{base}{path}", params=params_, headers=hdrs, timeout=20)
+        return r.json() if r.ok else None
 
     try:
-        # 1 — Expirations (current year only)
-        r1 = _req.get(f"{base}/options/expirations",
-                      params={"symbol": ticker, "includeAllRoots": "true", "strikes": "true"},
-                      headers=hdrs, timeout=15)
-        if not r1.ok:
-            return []
-        exp_raw = r1.json().get("expirations", {}).get("date", [])
-        if not exp_raw:
-            return []
+        d = get("/options/expirations", symbol=ticker, includeAllRoots="true")
+        exp_raw = ((d or {}).get("expirations") or {}).get("date") or []
         if isinstance(exp_raw, str):
             exp_raw = [exp_raw]
-        expirations = [e for e in exp_raw if str(e).startswith(current_year)]
+        expirations = W.target_expiries(exp_raw, today_dt)
         if not expirations:
             return []
-
-        # 2 — Spot price
-        r2 = _req.get(f"{base}/quotes",
-                      params={"symbols": ticker, "greeks": "false"},
-                      headers=hdrs, timeout=15)
-        if not r2.ok:
-            return []
-        quote = r2.json().get("quotes", {}).get("quote", {})
-        if isinstance(quote, list):
-            quote = quote[0] if quote else {}
-        spot = quote.get("last") or quote.get("close") or quote.get("prevclose")
+        q = ((get("/quotes", symbols=ticker, greeks="false") or {}).get("quotes") or {}).get("quote") or {}
+        if isinstance(q, list):
+            q = q[0] if q else {}
+        spot = W.spot_from_quote(q)
         if not spot or spot <= 0:
             return []
-        spot = float(spot)
 
-        pairs = []
-        atm_points = []   # (dte, expiry, atm_iv_decimal) for the daily ATM IV snapshot
-
-        # 3 — Per-expiration chain scan
+        pairs, atm_points = [], []
         for expiry in expirations:
             try:
-                dte = (date.fromisoformat(str(expiry)) - today_dt).days
-                if dte < 0:
+                ch = ((get("/options/chains", symbol=ticker, expiration=expiry, greeks="true") or {}).get("options") or {}).get("option") or []
+                if isinstance(ch, dict):
+                    ch = [ch]
+                if not ch:
                     continue
-
-                r3 = _req.get(f"{base}/options/chains",
-                              params={"symbol": ticker, "expiration": expiry, "greeks": "true"},
-                              headers=hdrs, timeout=20)
-                if not r3.ok:
-                    continue
-                chain = r3.json().get("options", {}).get("option", [])
-                if not chain:
-                    continue
-                if isinstance(chain, dict):
-                    chain = [chain]
-
                 if atm_out is not None:
-                    _atm = _atm_iv_from_chain(chain, spot)
+                    _atm = _atm_iv_from_chain(ch, spot)
                     if _atm:
-                        atm_points.append((dte, str(expiry), _atm))
-
-                puts_by_strike  = {}
-                calls_by_strike = {}
-                for opt in chain:
-                    s = opt.get("strike")
-                    if s is None:
-                        continue
-                    ot = opt.get("option_type")
-                    if ot == "put":
-                        puts_by_strike[float(s)]  = opt
-                    elif ot == "call":
-                        calls_by_strike[float(s)] = opt
-
-                def _get_iv(opt):
-                    """Extract IV in decimal form from greeks, with fallback chain."""
-                    if not opt:
-                        return None
-                    g = opt.get("greeks") or {}
-                    iv = g.get("mid_iv") or g.get("smv_vol") or g.get("ask_iv") or opt.get("implied_volatility")
-                    try:
-                        return float(iv) if iv is not None else None
-                    except (TypeError, ValueError):
-                        return None
-
-                def _mid(opt):
-                    try:
-                        bid = float(opt.get("bid") or 0)
-                        ask = float(opt.get("ask") or 0)
-                        return round((bid + ask) / 2, 4) if ask > 0 else None
-                    except (TypeError, ValueError):
-                        return None
-
-                call_strikes_sorted = sorted(calls_by_strike.keys())
-
-                for put_strike, put_opt in puts_by_strike.items():
-                    otm_pct = (spot - put_strike) / spot
-                    if otm_pct < min_otm:
-                        continue
-
-                    # Equidistant call: same absolute distance above spot
-                    call_target = spot + (spot - put_strike)
-                    if not call_strikes_sorted:
-                        continue
-                    call_strike = min(call_strikes_sorted, key=lambda s: abs(s - call_target))
-                    call_opt    = calls_by_strike.get(call_strike)
-                    if not call_opt:
-                        continue
-
-                    put_iv  = _get_iv(put_opt)
-                    call_iv = _get_iv(call_opt)
-                    if put_iv is None or call_iv is None:
-                        continue
-
-                    iv_diff = put_iv - call_iv   # decimal; negative = put skew
-                    if abs(iv_diff) < min_iv_diff:
-                        continue
-
-                    put_vol  = int(put_opt.get("volume")        or 0)
-                    call_vol = int(call_opt.get("volume")       or 0)
-                    put_oi_v = int(put_opt.get("open_interest") or 0)
-                    call_oi_v= int(call_opt.get("open_interest")or 0)
-
-                    if put_vol < min_vol or call_vol < min_vol:
-                        continue
-                    if put_oi_v < min_oi or call_oi_v < min_oi:
-                        continue
-
-                    pcr = round(put_oi_v / call_oi_v, 3) if call_oi_v > 0 else None
-
-                    put_bias  = iv_diff < 0 and put_oi_v > call_oi_v and pcr is not None and pcr > 1
-                    call_bias = iv_diff > 0 and call_oi_v > put_oi_v and pcr is not None and pcr < 1
-                    if not put_bias and not call_bias:
-                        continue
-
-                    pairs.append({
-                        "ticker":      ticker,
-                        "expiry":      str(expiry),
-                        "dte":         dte,
-                        "otm_pct":     round(otm_pct * 100, 2),   # % e.g. 22.5
-                        "spot":        round(spot, 4),
-                        "put_strike":  put_strike,
-                        "call_strike": call_strike,
-                        "put_iv":      round(put_iv  * 100, 4),   # % e.g. 35.0
-                        "call_iv":     round(call_iv * 100, 4),
-                        "iv_diff":     round(iv_diff * 100, 4),   # negative = put bias
-                        "bias":        "put" if put_bias else "call",
-                        "put_volume":  put_vol,
-                        "call_volume": call_vol,
-                        "put_oi":      put_oi_v,
-                        "call_oi":     call_oi_v,
-                        "pcr":         pcr,
-                        "put_mid":     _mid(put_opt),
-                        "call_mid":    _mid(call_opt),
-                    })
-
+                        atm_points.append((W.dte(expiry, today_dt), str(expiry), _atm))
+                pairs += W.pairs_for_expiry(ticker, expiry, ch, spot, today_dt, p["min_otm"], p["min_iv_diff"],
+                                            p["min_vol"], p["min_oi"])
             except Exception as exp_exc:
                 logger.warning("wing scan %s expiry %s: %s", ticker, expiry, exp_exc)
-                continue
+            time.sleep(0.08)
 
         if atm_out is not None:
             try:
-                # The wing scan only looks at current-year expiries; late in the year
-                # none may reach 30 DTE, so fetch the first expiry beyond it for ATM IV.
-                if not any(d >= 30 for d, _, _ in atm_points):
-                    beyond = sorted(e for e in exp_raw
-                                    if str(e) not in expirations
-                                    and (date.fromisoformat(str(e)) - today_dt).days >= 30)
+                # current-year expiries may not reach 30 DTE late in the year: fetch the first one beyond it
+                if not any(dd >= 30 for dd, _, _ in atm_points):
+                    beyond = sorted(e for e in exp_raw if str(e) not in expirations and W.dte(e, today_dt) >= 30)
                     if beyond:
                         e = beyond[0]
-                        r4 = _req.get(f"{base}/options/chains",
-                                      params={"symbol": ticker, "expiration": e, "greeks": "true"},
-                                      headers=hdrs, timeout=20)
-                        if r4.ok:
-                            ch = r4.json().get("options", {}).get("option", []) or []
-                            if isinstance(ch, dict):
-                                ch = [ch]
-                            _atm = _atm_iv_from_chain(ch, spot)
-                            if _atm:
-                                atm_points.append(((date.fromisoformat(str(e)) - today_dt).days, str(e), _atm))
+                        ch = ((get("/options/chains", symbol=ticker, expiration=e, greeks="true") or {}).get("options") or {}).get("option") or []
+                        if isinstance(ch, dict):
+                            ch = [ch]
+                        _atm = _atm_iv_from_chain(ch, spot)
+                        if _atm:
+                            atm_points.append((W.dte(e, today_dt), str(e), _atm))
                 cm = _constant_maturity_iv(atm_points, 30)
                 if cm:
                     atm_out.update(cm, ticker=ticker, spot=round(spot, 4))
             except Exception as atm_exc:
                 logger.warning("ATM IV snapshot %s: %s", ticker, atm_exc)
-
         return pairs
-
     except Exception as exc:
         logger.warning("wing scan error %s: %s", ticker, exc)
         return []
+
+
+def _ny_today() -> date:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).date()
 
 
 def _run_technicals_eod():
@@ -858,10 +723,11 @@ def _run_wing_eod():
     total_pairs   = 0
 
     logger.info("_run_wing_eod: scanning %d tickers via Tradier", len(all_tkrs))
+    trade_day = _ny_today()
     iv_rows = []   # one ATM IV row per ticker for the iv_history table
     for ticker in all_tkrs:
         atm = {}
-        pairs = _wing_scan_ticker(ticker, tradier_key, atm_out=atm)
+        pairs = _wing_scan_ticker(ticker, tradier_key, atm_out=atm, today=trade_day)
         if atm.get("atm_iv_30d") is not None:
             iv_rows.append(atm)
         if pairs:
@@ -873,9 +739,9 @@ def _run_wing_eod():
 
     for ukey, rows in results_by_u.items():
         if rows:
-            _db.save_wing_snapshot(ukey, rows)
+            _db.save_wing_snapshot(ukey, rows, snap_date=trade_day)
 
-    iv_written = _db.save_iv_snapshot(iv_rows)
+    iv_written = _db.save_iv_snapshot(iv_rows, snap_date=trade_day)
     logger.info("_run_wing_eod: ATM IV saved for %d of %d tickers", iv_written, len(all_tkrs))
 
     logger.info("_run_wing_eod complete — %d pairs found, %d universes written",
@@ -1378,27 +1244,126 @@ def get_technicals():
     return resp
 
 
+# ── Options skew (Wing) — persisted nightly history + live scans, one implementation (wing.py) ──────────
+WING_LIVE: dict = {}            # universe -> {running, scanned, total, results, started, scanned_at, error, params}
+_wing_live_lock = threading.Lock()
+
+
+def _json_rows(rows):
+    out = []
+    for r in rows:
+        r = dict(r)
+        for k, v in list(r.items()):
+            if isinstance(v, (date, datetime)):
+                r[k] = v.isoformat()
+        out.append(r)
+    return out
+
+
 @app.route("/api/options-skew")
 def get_options_skew():
     """
-    GET /api/options-skew?universe=portfolio&bias=all
-    Returns latest Wing Scanner results from DB (Options Skew tab).
-
-    Query params:
-      universe  — universe key (default: portfolio)
-      bias      — 'put' | 'call' | 'all' (default: all)
+    GET /api/options-skew?universe=portfolio|all&bias=all|put|call&live=0|1
+    The last nightly scan from wing_snapshot. With live=1, a live scan of a universe finished today
+    replaces that universe's nightly rows (what the Radar uses intraday).
     """
     universe = request.args.get("universe", "portfolio")
     bias     = request.args.get("bias", "all")
-
-    rows = _db.get_wing_snapshot(universe, bias=None if bias == "all" else bias)
-
-    resp = jsonify({"results": rows, "universe": universe, "count": len(rows), "bias": bias})
-    resp.headers['Cache-Control'] = 'public, max-age=3600'
+    live     = request.args.get("live") == "1"
+    b = None if bias == "all" else bias
+    rows = _db.get_wing_snapshot_all(b) if universe == "all" else _db.get_wing_snapshot(universe, bias=b)
+    rows = _json_rows(rows)
+    source = "nightly"
+    if live:
+        today = _ny_today().isoformat()
+        with _wing_live_lock:
+            done = {u: st for u, st in WING_LIVE.items()
+                    if not st.get("running") and (st.get("scanned_at") or "")[:10] == today and st.get("results") is not None
+                    and (universe == "all" or u == universe)}
+        if done:
+            live_tk = set()
+            live_rows = []
+            for u, st in done.items():
+                tks = set(st.get("tickers") or [])
+                live_tk |= tks
+                live_rows += [r for r in st["results"] if not b or r.get("bias") == b]
+            rows = [r for r in rows if r.get("ticker") not in live_tk] + live_rows
+            source = "nightly + live (" + ", ".join(done) + ")"
+    resp = jsonify({"results": rows, "universe": universe, "count": len(rows), "bias": bias, "source": source})
+    resp.headers['Cache-Control'] = 'no-store' if live else 'public, max-age=3600'
     return resp
 
 
-# ── Political trades ──────────────────────────────────────────────────────────
+def _wing_live_scan(universe: str, tickers: list, params: dict):
+    key = os.environ.get('TRADIER_API_KEY', '')
+    st = WING_LIVE[universe]
+    try:
+        if not key:
+            raise RuntimeError("TRADIER_API_KEY not set")
+        for t in tickers:
+            if st.get("abort"):
+                break
+            rows = _wing_scan_ticker(t, key, params=params)
+            with _wing_live_lock:
+                st["results"].extend(rows)
+                st["scanned"] += 1
+                st["pairs_by_ticker"][t] = len(rows)
+            time.sleep(0.3)
+    except Exception as exc:
+        logger.exception("live wing scan %s failed", universe)
+        st["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        st["running"] = False
+        st["scanned_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.route("/api/options-skew/scan", methods=["POST"])
+def options_skew_scan():
+    """Start a live scan of one universe (same rules as the nightly job). Poll /api/options-skew/poll."""
+    import wing as W
+    body = request.get_json(silent=True) or {}
+    universe = body.get("universe") or request.args.get("universe") or "portfolio"
+    tickers = body.get("tickers") or _resolve_universe_tickers(universe)
+    if not tickers:
+        return jsonify({"status": "error", "error": f"universe {universe} has no tickers"}), 400
+    params = {k: float(body[k]) if k in ("min_otm", "min_iv_diff") else int(body[k])
+              for k in W.DEFAULTS if body.get(k) not in (None, "")}
+    with _wing_live_lock:
+        cur = WING_LIVE.get(universe)
+        if cur and cur.get("running"):
+            return jsonify({"status": "already running", "scanned": cur["scanned"], "total": cur["total"]})
+        WING_LIVE[universe] = {"running": True, "scanned": 0, "total": len(tickers), "results": [], "pairs_by_ticker": {},
+                               "tickers": list(tickers), "started": _now(), "scanned_at": None, "error": None,
+                               "params": {**W.DEFAULTS, **params}}
+    threading.Thread(target=_wing_live_scan, args=(universe, list(tickers), params), daemon=True).start()
+    return jsonify({"status": "started", "total": len(tickers)})
+
+
+@app.route("/api/options-skew/poll")
+def options_skew_poll():
+    """Progress and results so far of the live scan for a universe."""
+    universe = request.args.get("universe", "portfolio")
+    since = int(request.args.get("since", 0) or 0)      # only rows after this index (incremental)
+    with _wing_live_lock:
+        st = WING_LIVE.get(universe)
+        if not st:
+            resp = jsonify({"universe": universe, "running": False, "started": None, "results": [], "count": 0})
+        else:
+            resp = jsonify({"universe": universe, "running": st["running"], "scanned": st["scanned"], "total": st["total"],
+                            "started": st["started"], "scanned_at": st["scanned_at"], "error": st["error"], "params": st["params"],
+                            "count": len(st["results"]), "results": st["results"][since:], "since": since})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+@app.route("/api/options-skew/stop", methods=["POST"])
+def options_skew_stop():
+    universe = (request.get_json(silent=True) or {}).get("universe") or request.args.get("universe", "portfolio")
+    st = WING_LIVE.get(universe)
+    if st and st.get("running"):
+        st["abort"] = True
+    return jsonify({"status": "stopping" if st and st.get("running") else "not running"})
+
 
 @app.route("/api/political-trades")
 def get_political_trades():

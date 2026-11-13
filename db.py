@@ -375,7 +375,33 @@ def init_db():
         except Exception as exc:
             if "duplicate" not in str(exc).lower() and "already exists" not in str(exc).lower():
                 logger.warning("Migration failed (%s): %s", sql[:60], exc)
+    _run_once_migrations()
     logger.info("DB ready: %s", _DATABASE_URL.split("@")[-1])  # hide credentials
+
+
+# One-off data migrations: each runs exactly once per database (recorded in app_migrations).
+_ONCE_MIGRATIONS = [
+    # Nov 2026: wing_snapshot rows written before the options-skew scan was re-ported from the tab had the
+    # IV-difference sign reversed (kept only pairs where IV skew contradicted open interest). Not repairable
+    # (the correct pairs were never saved), so they are deleted. iv_history is unaffected and kept.
+    ("2026-11-13_purge_wing_snapshot_reversed_sign", "DELETE FROM wing_snapshot"),
+]
+
+
+def _run_once_migrations():
+    try:
+        with _engine.begin() as conn:
+            conn.execute(text("CREATE TABLE IF NOT EXISTS app_migrations (name VARCHAR(120) PRIMARY KEY, applied_at TIMESTAMP, detail TEXT)"))
+        for name, sql in _ONCE_MIGRATIONS:
+            with _engine.begin() as conn:
+                if conn.execute(text("SELECT 1 FROM app_migrations WHERE name = :n"), {"n": name}).first():
+                    continue
+                res = conn.execute(text(sql))
+                conn.execute(text("INSERT INTO app_migrations (name, applied_at, detail) VALUES (:n, :t, :d)"),
+                             {"n": name, "t": datetime.utcnow(), "d": f"rows affected: {res.rowcount}"})
+                logger.info("One-off migration %s applied (%s rows)", name, res.rowcount)
+    except Exception as exc:
+        logger.error("One-off migrations failed: %s", exc)
 
 
 # ── Fundamentals snapshot functions ──────────────────────────────────────────
@@ -614,17 +640,18 @@ def get_technicals_snapshot(universe: str) -> list:
 
 # ── Wing snapshot functions (Options Skew tab) ────────────────────────────────
 
-def save_wing_snapshot(universe: str, pairs: list):
+def save_wing_snapshot(universe: str, pairs: list, snap_date: date = None):
     """
-    Upsert wing scan pair rows for today.
-    Multiple rows per ticker (one per detected equidistant OTM pair).
+    Replace the universe's wing pairs for the trade date (NY date of the nightly run, passed in so a job
+    that runs past midnight UTC still files under the right day). One row per qualifying pair.
     """
     if not pairs:
         return
-    today = date.today()
+    today = snap_date or date.today()
     session = _Session()
     inserted = updated = 0
     try:
+        session.query(WingSnapshot).filter_by(snapshot_date=today, universe=universe).delete()
         for row in pairs:
             ticker     = (row.get("ticker") or "").upper()
             expiry     = row.get("expiry", "")
@@ -695,11 +722,31 @@ def get_wing_snapshot(universe: str, bias: str = None) -> list:
 
 
 
-def save_iv_snapshot(rows: list) -> int:
-    """Upsert today's ATM IV rows (one per ticker). Returns rows written."""
+def get_wing_snapshot_all(bias: str = None) -> list:
+    """Latest nightly wing pairs across every universe (one row per ticker/expiry/put strike)."""
+    session = _Session()
+    try:
+        rows = session.execute(text("""
+            SELECT DISTINCT ON (ticker, expiry, put_strike) *
+            FROM wing_snapshot
+            WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM wing_snapshot)
+            ORDER BY ticker, expiry, put_strike, id DESC
+        """)).fetchall()
+        result = [dict(r._mapping) for r in rows]
+        if bias and bias != "all":
+            result = [r for r in result if r.get("bias") == bias]
+        return result
+    except Exception as e:
+        logger.error("get_wing_snapshot_all error: %s", e)
+        return []
+    finally:
+        session.close()
+
+def save_iv_snapshot(rows: list, snap_date: date = None) -> int:
+    """Upsert the trade date's ATM IV rows (one per ticker). Returns rows written."""
     if not rows:
         return 0
-    today = date.today()
+    today = snap_date or date.today()
     cols = ("spot", "atm_iv_30d", "near_expiry", "near_dte", "near_iv",
             "far_expiry", "far_dte", "far_iv", "method")
     session = _Session()
