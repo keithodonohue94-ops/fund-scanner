@@ -579,7 +579,7 @@ def _constant_maturity_iv(points: list, target_dte: int = 30) -> dict:
 
 
 def _wing_scan_ticker(ticker: str, tradier_key: str, atm_out: dict = None, params: dict = None,
-                      today: date = None) -> list:
+                      today: date = None, diag: dict = None) -> list:
     """
     Options-skew scan for one ticker via Tradier. Pair selection lives in wing.py — an exact, parity-tested
     port of the Options Skew tab's original browser scan (see wing.py for the rules).
@@ -594,10 +594,16 @@ def _wing_scan_ticker(ticker: str, tradier_key: str, atm_out: dict = None, param
     base = "https://api.tradier.com/v1/markets"
     hdrs = {"Authorization": f"Bearer {tradier_key}", "Accept": "application/json"}
     today_dt = today or _ny_today()
+    dg = diag if diag is not None else {}
+    bump = lambda k, n=1: dg.__setitem__(k, dg.get(k, 0) + n)
 
     def get(path, **params_):
         r = _req.get(f"{base}{path}", params=params_, headers=hdrs, timeout=20)
-        return r.json() if r.ok else None
+        if not r.ok:
+            bump(f"http_{r.status_code}")
+            dg.setdefault("http_error_sample", f"{path} → {r.status_code}: {r.text[:160]}")
+            return None
+        return r.json()
 
     try:
         d = get("/options/expirations", symbol=ticker, includeAllRoots="true")
@@ -606,13 +612,16 @@ def _wing_scan_ticker(ticker: str, tradier_key: str, atm_out: dict = None, param
             exp_raw = [exp_raw]
         expirations = W.target_expiries(exp_raw, today_dt)
         if not expirations:
+            bump("tickers_no_expiries")
             return []
         q = ((get("/quotes", symbols=ticker, greeks="false") or {}).get("quotes") or {}).get("quote") or {}
         if isinstance(q, list):
             q = q[0] if q else {}
         spot = W.spot_from_quote(q)
         if not spot or spot <= 0:
+            bump("tickers_no_spot")
             return []
+        bump("expiries", len(expirations))
 
         pairs, atm_points = [], []
         for expiry in expirations:
@@ -621,13 +630,14 @@ def _wing_scan_ticker(ticker: str, tradier_key: str, atm_out: dict = None, param
                 if isinstance(ch, dict):
                     ch = [ch]
                 if not ch:
+                    bump("chains_empty")
                     continue
                 if atm_out is not None:
                     _atm = _atm_iv_from_chain(ch, spot)
                     if _atm:
                         atm_points.append((W.dte(expiry, today_dt), str(expiry), _atm))
                 pairs += W.pairs_for_expiry(ticker, expiry, ch, spot, today_dt, p["min_otm"], p["min_iv_diff"],
-                                            p["min_vol"], p["min_oi"])
+                                            p["min_vol"], p["min_oi"], stats=dg)
             except Exception as exp_exc:
                 logger.warning("wing scan %s expiry %s: %s", ticker, expiry, exp_exc)
             time.sleep(0.08)
@@ -653,6 +663,8 @@ def _wing_scan_ticker(ticker: str, tradier_key: str, atm_out: dict = None, param
         return pairs
     except Exception as exc:
         logger.warning("wing scan error %s: %s", ticker, exc)
+        bump("ticker_exceptions")
+        dg.setdefault("exception_sample", f"{ticker}: {type(exc).__name__}: {exc}")
         return []
 
 
@@ -1303,7 +1315,7 @@ def _wing_live_scan(universe: str, tickers: list, params: dict):
         for t in tickers:
             if st.get("abort"):
                 break
-            rows = _wing_scan_ticker(t, key, params=params)
+            rows = _wing_scan_ticker(t, key, params=params, diag=st["diag"])
             with _wing_live_lock:
                 st["results"].extend(rows)
                 st["scanned"] += 1
@@ -1333,7 +1345,7 @@ def options_skew_scan():
         if cur and cur.get("running"):
             return jsonify({"status": "already running", "scanned": cur["scanned"], "total": cur["total"]})
         WING_LIVE[universe] = {"running": True, "scanned": 0, "total": len(tickers), "results": [], "pairs_by_ticker": {},
-                               "tickers": list(tickers), "started": _now(), "scanned_at": None, "error": None,
+                               "tickers": list(tickers), "started": _now(), "scanned_at": None, "error": None, "diag": {},
                                "params": {**W.DEFAULTS, **params}}
     threading.Thread(target=_wing_live_scan, args=(universe, list(tickers), params), daemon=True).start()
     return jsonify({"status": "started", "total": len(tickers)})
@@ -1351,7 +1363,25 @@ def options_skew_poll():
         else:
             resp = jsonify({"universe": universe, "running": st["running"], "scanned": st["scanned"], "total": st["total"],
                             "started": st["started"], "scanned_at": st["scanned_at"], "error": st["error"], "params": st["params"],
-                            "count": len(st["results"]), "results": st["results"][since:], "since": since})
+                            "count": len(st["results"]), "results": st["results"][since:], "since": since,
+                            "diag": dict(st.get("diag") or {})})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+@app.route("/api/options-skew/debug")
+def options_skew_debug():
+    """One ticker, synchronously: pairs + why candidates were rejected + any Tradier HTTP errors."""
+    import wing as W
+    t = (request.args.get("ticker") or "NVDA").upper()
+    key = os.environ.get('TRADIER_API_KEY', '')
+    if not key:
+        return jsonify({"error": "TRADIER_API_KEY not set on fund-scanner"}), 500
+    params = {k: float(request.args[k]) for k in W.DEFAULTS if request.args.get(k)}
+    diag: dict = {}
+    pairs = _wing_scan_ticker(t, key, params=params, diag=diag)
+    resp = jsonify({"ticker": t, "today_ny": _ny_today().isoformat(), "params": {**W.DEFAULTS, **params},
+                    "key_suffix": key[-4:], "pairs": len(pairs), "diag": diag, "sample": pairs[:5]})
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 

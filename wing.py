@@ -87,7 +87,10 @@ def target_expiries(expirations: list, today: date) -> list:
 
 def pairs_for_expiry(ticker: str, expiry: str, chain: list, spot: float, today: date,
                      min_otm=DEFAULTS["min_otm"], min_iv_diff=DEFAULTS["min_iv_diff"],
-                     min_vol=DEFAULTS["min_vol"], min_oi=DEFAULTS["min_oi"]) -> list:
+                     min_vol=DEFAULTS["min_vol"], min_oi=DEFAULTS["min_oi"], stats: dict | None = None) -> list:
+    """stats (optional): counts why candidate pairs were rejected — diagnostics only, never changes the result."""
+    st = stats if stats is not None else {}
+    bump = lambda k: st.__setitem__(k, st.get(k, 0) + 1)
     chain = chain or []
     puts = [o for o in chain if o.get("option_type") == "put"]
     calls = [o for o in chain if o.get("option_type") == "call"]
@@ -95,6 +98,7 @@ def pairs_for_expiry(ticker: str, expiry: str, chain: list, spot: float, today: 
     put_strikes = sorted({float(o["strike"]) for o in puts if float(o["strike"]) <= put_thr}, reverse=True)
     call_strikes = sorted({float(o["strike"]) for o in calls if float(o["strike"]) >= call_thr})
     if not put_strikes or not call_strikes:
+        bump("expiry_no_strikes_beyond_min_otm")
         return []
     rows, seen = [], set()
     for ps in put_strikes:
@@ -102,6 +106,7 @@ def pairs_for_expiry(ticker: str, expiry: str, chain: list, spot: float, today: 
         if otm < min_otm or otm in seen:
             continue
         seen.add(otm)
+        bump("candidates")
         target = spot * (1 + otm / 100)
         call = None
         for o in calls:                       # closest call to target; first wins ties (JS reduce)
@@ -114,24 +119,31 @@ def pairs_for_expiry(ticker: str, expiry: str, chain: list, spot: float, today: 
             continue
         put_iv, call_iv = _iv(put), _iv(call)
         if not put_iv or not call_iv or math.isnan(put_iv) or math.isnan(call_iv):
+            bump("rej_no_iv")
             continue
         call_mid, put_mid = _mid(call), _mid(put)
         put_vol, call_vol = _int(put.get("volume")), _int(call.get("volume"))
         put_oi, call_oi = _int(put.get("open_interest")), _int(call.get("open_interest"))
         if put_vol < min_vol or call_vol < min_vol:
+            bump("rej_volume")
             continue
         if put_oi < min_oi or call_oi < min_oi:
+            bump("rej_open_interest")
             continue
         iv_diff = call_iv - put_iv
         if abs(iv_diff) < min_iv_diff / 100:
+            bump("rej_iv_diff")
             continue
         if call_vol <= 0:
+            bump("rej_volume")
             continue
         pcr = _to_fixed3(put_vol / call_vol)
         put_bias = iv_diff < 0 and put_oi > call_oi and pcr > 1
         call_bias = iv_diff > 0 and call_oi > put_oi and pcr < 1
         if not put_bias and not call_bias:
+            bump("rej_bias_not_confirmed")
             continue
+        bump("kept")
         rows.append({"ticker": ticker, "expiry": str(expiry), "dte": dte(expiry, today), "otm_pct": otm, "spot": spot,
                      "put_strike": ps, "call_strike": float(call["strike"]),
                      "put_iv": put_iv, "call_iv": call_iv, "iv_diff": iv_diff,
