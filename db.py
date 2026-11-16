@@ -11,7 +11,7 @@ Falls back to SQLite for local development.
 import os
 import logging
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import (
     create_engine, Column, Float, String, Date, DateTime,
@@ -110,6 +110,7 @@ class PoliticalTrade(Base):
     price_30d          = Column(Float)                  # EOD close ~30 days after trade_date
     price_60d          = Column(Float)                  # EOD close ~60 days after trade_date
     price_90d          = Column(Float)                  # EOD close ~90 days after trade_date
+    price_checked_at   = Column(DateTime)               # last failed attempt to price price_at_trade
     created_at  = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -341,6 +342,7 @@ def init_db():
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_last_updated TIMESTAMP",
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_30d FLOAT",
         "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_60d FLOAT",
+        "ALTER TABLE political_trades ADD COLUMN IF NOT EXISTS price_checked_at TIMESTAMP",
         # fundamentals_snapshot columns added Sep 2026
         "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS avg_pt FLOAT",
         "ALTER TABLE fundamentals_snapshot ADD COLUMN IF NOT EXISTS pt_pct FLOAT",
@@ -375,8 +377,35 @@ def init_db():
         except Exception as exc:
             if "duplicate" not in str(exc).lower() and "already exists" not in str(exc).lower():
                 logger.warning("Migration failed (%s): %s", sql[:60], exc)
+    _add_missing_model_columns()
     _run_once_migrations()
     logger.info("DB ready: %s", _DATABASE_URL.split("@")[-1])  # hide credentials
+
+
+def _add_missing_model_columns():
+    """create_all() never alters an existing table, so a column a model declares can be missing from the live
+    table (Nov 2026: fundamentals_snapshot.debt_to_equity was, which made every nightly snapshot save and
+    every read fail). Add any declared column the table lacks — nullable, no default, idempotent."""
+    from sqlalchemy import inspect
+    try:
+        insp = inspect(_engine)
+        tables = set(insp.get_table_names())
+        for table in Base.metadata.sorted_tables:
+            if table.name not in tables:
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have or col.primary_key:
+                    continue
+                ddl = f'ALTER TABLE {table.name} ADD COLUMN {col.name} {col.type.compile(dialect=_engine.dialect)}'
+                try:
+                    with _engine.begin() as conn:
+                        conn.execute(text(ddl))
+                    logger.warning("Schema sync: added missing column %s.%s", table.name, col.name)
+                except Exception as exc:
+                    logger.error("Schema sync failed (%s): %s", ddl, exc)
+    except Exception as exc:
+        logger.error("Schema sync check failed: %s", exc)
 
 
 # One-off data migrations: each runs exactly once per database (recorded in app_migrations).
@@ -1390,10 +1419,14 @@ def get_ticker_sector_map(tickers: list) -> dict:
         session.close()
 
 
-def get_trades_missing_at_price(limit: int = 500) -> list:
-    """Return list of {id, ticker, trade_date} for trades that have no price_at_trade yet."""
+def get_trades_missing_at_price(limit: int = 500, retry_after_days: int = 3) -> list:
+    """{id, ticker, trade_date} for trades with no price_at_trade yet — newest trades first, skipping rows
+    whose last attempt failed within `retry_after_days` (so permanently unpriceable rows, e.g. delisted
+    tickers, can't block the queue: they are retried every few days, behind everything else)."""
+    from sqlalchemy import or_
     session = _Session()
     try:
+        cutoff = datetime.utcnow() - timedelta(days=retry_after_days)
         rows = session.query(
             PoliticalTrade.id,
             PoliticalTrade.ticker,
@@ -1402,8 +1435,25 @@ def get_trades_missing_at_price(limit: int = 500) -> list:
             PoliticalTrade.price_at_trade == None,
             PoliticalTrade.trade_date != None,
             PoliticalTrade.trade_date != "",
-        ).limit(limit).all()
+            or_(PoliticalTrade.price_checked_at == None, PoliticalTrade.price_checked_at < cutoff),
+        ).order_by(PoliticalTrade.trade_date.desc(), PoliticalTrade.id.desc()).limit(limit).all()
         return [{"id": r[0], "ticker": r[1], "trade_date": r[2]} for r in rows]
+    finally:
+        session.close()
+
+
+def mark_price_attempted(ids: list) -> None:
+    """Stamp rows whose price_at_trade could not be fetched, so the next batch moves past them."""
+    if not ids:
+        return
+    session = _Session()
+    try:
+        session.query(PoliticalTrade).filter(PoliticalTrade.id.in_(list(ids))).update(
+            {PoliticalTrade.price_checked_at: datetime.utcnow()}, synchronize_session=False)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("mark_price_attempted error: %s", exc)
     finally:
         session.close()
 

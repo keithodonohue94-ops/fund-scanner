@@ -550,8 +550,9 @@ def _fetch_all(symbol: str) -> dict:
         peg, peg_method = peg_result
     else:
         peg, peg_method = None, None
-    if peg is None:
-        # Last resort: FMP's own pegRatio (stale price but better than blank)
+    if peg is None and fwd_pe:
+        # Last resort: FMP's own pegRatio (stale price but better than blank). Only with positive forward
+        # EPS: a PEG for a loss-maker is meaningless (FMP still publishes one, e.g. 0.03).
         peg_fmp = ratios.get("peg_fmp")
         if peg_fmp and peg_fmp > 0:
             peg, peg_method = round(peg_fmp, 2), "fmp"
@@ -651,7 +652,7 @@ def backfill_trade_prices(batch_size: int = 200) -> dict:
     missing = _db.get_trades_missing_at_price(limit=batch_size)
     if not missing:
         logger.info("backfill_trade_prices: nothing to do")
-        return {"filled_at": 0, "filled_last": 0, "errors": 0}
+        return {"attempted": 0, "filled_at": 0, "filled_last": 0, "errors": 0}
 
     logger.info("backfill_trade_prices: %d trades to price", len(missing))
 
@@ -730,10 +731,27 @@ def backfill_trade_prices(batch_size: int = 200) -> dict:
 
     if updates:
         _db.bulk_update_trade_prices(updates)
+    # rows still without an at-trade price: stamp them so the next batch moves on to other trades
+    priced_ids = {u["id"] for u in updates if u.get("price_at_trade")}
+    _db.mark_price_attempted([r["id"] for r in missing if r["id"] not in priced_ids])
 
-    logger.info("backfill_trade_prices done: filled_at=%d filled_last=%d errors=%d",
-                filled_at, filled_last, errors)
-    return {"filled_at": filled_at, "filled_last": filled_last, "errors": errors}
+    logger.info("backfill_trade_prices done: attempted=%d filled_at=%d filled_last=%d errors=%d",
+                len(missing), filled_at, filled_last, errors)
+    return {"attempted": len(missing), "filled_at": filled_at, "filled_last": filled_last, "errors": errors}
+
+
+def backfill_all_trade_prices(batch_size: int = 500, max_rows: int = 20000) -> dict:
+    """Price every pending trade, newest first, batch after batch until the queue is empty (rows that fail
+    are stamped and skipped for a few days, so the loop always terminates)."""
+    tot = {"attempted": 0, "filled_at": 0, "errors": 0, "batches": 0}
+    while tot["attempted"] < max_rows:
+        r = backfill_trade_prices(batch_size=batch_size)
+        if not r.get("attempted"):
+            break
+        tot["batches"] += 1
+        for k in ("attempted", "filled_at", "errors"):
+            tot[k] += r.get(k, 0)
+    return tot
 
 
 def refresh_last_prices() -> int:

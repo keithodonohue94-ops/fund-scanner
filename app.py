@@ -28,7 +28,7 @@ from scanner import (
     scan_tickers, _load_universes_from_db,
     _fetch_earnings_surprises, _fetch_earnings_calendar,
     _fetch_quote, _fetch_price_target, _fetch_ratios, _fetch_political_trades,
-    backfill_trade_prices, refresh_last_prices,
+    backfill_trade_prices, backfill_all_trade_prices, refresh_last_prices,
     fetch_political_trades_historical,
     fetch_forward_prices,
 )
@@ -768,6 +768,8 @@ def _run_wing_eod():
 from apscheduler.schedulers.background import BackgroundScheduler
 
 _EOD_STATE = {"running": False, "stage": None, "started": None, "finished": None, "error": None, "last_ok": None}
+_PRICE_BACKFILL_STATE = {"running": False}
+_price_backfill_lock = threading.Lock()
 _eod_lock = threading.Lock()
 
 
@@ -826,6 +828,25 @@ def _eod_job():
                 except Exception as _exc:
                     logger.warning("EPS re-fetch error %s: %s", _tk, _exc)
 
+        # ── Upcoming-quarter estimates for every ticker ───────────────────────
+        #   /api/earnings serves large requests (All Universes) from the DB without a live call per
+        #   ticker, so refresh each ticker's upcoming row nightly to keep consensus estimates current.
+        _EOD_STATE["stage"] = "earnings:upcoming"
+        try:
+            n_up = 0
+            for _tk in sorted(set(_all_tickers()) - todays_reporters):
+                try:
+                    _rows = [r for r in _fetch_earnings_surprises(_tk, limit=2) if r.get("is_upcoming")]
+                    if _rows:
+                        _db.upsert_earnings(_tk, _rows)
+                        n_up += 1
+                    time.sleep(0.15)
+                except Exception as _exc:
+                    logger.debug("Upcoming estimate refresh %s: %s", _tk, _exc)
+            logger.info("Upcoming earnings estimates refreshed for %d tickers", n_up)
+        except Exception as exc:
+            logger.error("Upcoming estimate refresh error: %s", exc)
+
         # ── Political trades refresh ──────────────────────────────────────────
         try:
             trades   = _fetch_political_trades(tickers=_all_tickers(), limit=100)
@@ -833,6 +854,13 @@ def _eod_job():
             logger.info("Political trades refresh — %d fetched, %d new", len(trades), inserted)
         except Exception as exc:
             logger.error("Political trades refresh error: %s", exc)
+
+        # ── Political trades: price new disclosures (at-trade close) ──────────
+        try:
+            res = backfill_all_trade_prices(batch_size=500)
+            logger.info("Political trades at-trade pricing — %s", res)
+        except Exception as exc:
+            logger.error("Political trades at-trade pricing error: %s", exc)
 
         # ── Political trades: refresh price_last for all priced rows ──────────
         try:
@@ -1140,13 +1168,17 @@ def get_earnings():
         # universe=all or no filter — return whatever is in the DB
         tickers = _db.get_all_earnings_tickers()
 
-    tickers = tickers[:200]
+    # No ticker cap: everything is served from the DB. Live FMP calls are bounded instead — tickers with no
+    # DB rows at all get at most EARN_LIVE_MAX live fetches per request (the nightly job backfills the rest),
+    # and the live refresh of upcoming estimates only runs for requests of up to EARN_LIVE_MAX tickers
+    # (larger requests use the upcoming rows the nightly job keeps current).
+    EARN_LIVE_MAX = 150
 
     # 1. Read actuals from DB
     results = _db.get_earnings_db(tickers)
 
     # 2. Live fallback for tickers with zero DB rows
-    missing = [t for t in tickers if not results.get(t)]
+    missing = [t for t in tickers if not results.get(t)][:EARN_LIVE_MAX]
     if missing:
         def _live_fetch(sym):
             rows = _fetch_earnings_surprises(sym, limit=8)
@@ -1169,7 +1201,7 @@ def get_earnings():
         return sym, upcoming
 
     tickers_with_db = [t for t in tickers if t not in missing and results.get(t)]
-    if tickers_with_db:
+    if tickers_with_db and len(tickers) <= EARN_LIVE_MAX:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
             for sym, upcoming_rows in pool.map(_patch_upcoming, tickers_with_db):
                 if upcoming_rows:
@@ -1400,7 +1432,7 @@ def get_political_trades():
     """GET /api/political-trades?tickers=AAPL,MSFT&limit=2000&trade_year=2024&disc_year=2024 — serves from DB."""
     tickers_raw = request.args.get("tickers", "")
     tickers = set(t.strip().upper() for t in tickers_raw.split(",") if t.strip()) if tickers_raw else None
-    limit = min(int(request.args.get("limit", 2000)), 5000)
+    limit = min(int(request.args.get("limit", 2000)), 20000)
     trade_year = request.args.get("trade_year") or None
     disc_year  = request.args.get("disc_year")  or None
     try:
@@ -1651,28 +1683,35 @@ def backfill_trade_prices_endpoint():
     Safe to call multiple times — only processes rows still missing prices.
     """
     batch = int(request.args.get("batch", 500))
+    if not _price_backfill_lock.acquire(blocking=False):
+        return jsonify({"status": "already running", **_PRICE_BACKFILL_STATE})
     def _run():
-        total_filled = 0
-        total_errors = 0
-        run = 0
-        while True:
-            try:
-                result = backfill_trade_prices(batch_size=batch)
-                filled = result.get("filled_at", 0)
-                total_filled += filled
-                total_errors += result.get("errors", 0)
-                run += 1
-                logger.info("backfill-prices run=%d filled=%d total_filled=%d errors=%d",
-                            run, filled, total_filled, total_errors)
-                if filled == 0:
-                    break  # nothing left to price
-            except Exception as exc:
-                logger.error("backfill-prices loop error: %s", exc)
-                break
-        logger.info("backfill-prices complete: total_filled=%d total_errors=%d",
-                    total_filled, total_errors)
+        _PRICE_BACKFILL_STATE.clear()
+        _PRICE_BACKFILL_STATE.update(running=True, started=_now())
+        try:
+            res = backfill_all_trade_prices(batch_size=batch)
+            _PRICE_BACKFILL_STATE.update(res)
+            logger.info("backfill-prices complete: %s", res)
+        except Exception as exc:
+            _PRICE_BACKFILL_STATE["error"] = str(exc)
+            logger.error("backfill-prices loop error: %s", exc)
+        finally:
+            _PRICE_BACKFILL_STATE.update(running=False, finished=_now())
+            _price_backfill_lock.release()
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "backfill_prices_started", "batch": batch})
+
+
+@app.route("/api/political-trades/backfill-prices", methods=["GET"])
+def backfill_trade_prices_status():
+    """Progress of the last backfill-prices run, plus how many trades are still unpriced."""
+    try:
+        pending = len(_db.get_trades_missing_at_price(limit=100000, retry_after_days=0))
+    except Exception as exc:
+        pending = f"error: {exc}"
+    resp = jsonify({**_PRICE_BACKFILL_STATE, "unpriced_total": pending})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/political-trades/refresh-last-prices", methods=["POST"])
