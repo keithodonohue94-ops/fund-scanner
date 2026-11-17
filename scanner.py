@@ -441,6 +441,9 @@ def _fetch_income(symbol: str) -> dict:
     ttm_rev = sum(filter(None, (_safe_float(q.get("revenue")) for q in data[:4])))
     out["ttm_eps"] = ttm_eps if ttm_eps != 0 else None
     out["ttm_rev"] = ttm_rev if ttm_rev != 0 else None
+    out["currency"] = (data[0].get("reportedCurrency") or "USD").upper()
+    ni = [_safe_float(q.get("netIncome")) for q in data[:4]]
+    out["ttm_net_income"] = sum(ni) if all(v is not None for v in ni) else None
 
     # Prior year TTM EPS (quarters 4-7, zero-indexed)
     if len(data) >= 8:
@@ -494,6 +497,29 @@ def _fetch_income(symbol: str) -> dict:
 
 
 
+_FX_CACHE: dict = {}
+
+
+def _fx_to_usd(cur: str) -> float | None:
+    """USD per one unit of `cur` from FMP's forex quote (cached 12h). None if FMP has no rate."""
+    cur = (cur or "USD").upper()
+    if cur == "USD":
+        return 1.0
+    hit = _FX_CACHE.get(cur)
+    if hit and time.time() - hit[1] < 43200:
+        return hit[0]
+    rate = None
+    for sym, invert in ((f"{cur}USD", False), (f"USD{cur}", True)):
+        q = _fmp_get(f"{FMP_STABLE}/quote", {"symbol": sym})
+        p = _safe_float(q[0].get("price")) if isinstance(q, list) and q else None
+        if p and p > 0:
+            rate = (1 / p) if invert else p
+            break
+    if rate:
+        _FX_CACHE[cur] = (rate, time.time())
+    return rate
+
+
 def _fetch_all(symbol: str) -> dict:
     """
     Fetch quote + FMP ratios + income margins for one ticker, return merged dict.
@@ -543,6 +569,27 @@ def _fetch_all(symbol: str) -> dict:
     pe_ttm = round(pe_ttm_raw, 1) if pe_ttm_raw is not None else None
     fwd_pe = round(price / fwd_eps, 1) if price and fwd_eps and fwd_eps > 0 else None
 
+    # ── Foreign reporters (ADRs: TSM, UMC, ASX …) ──────────────────────────────
+    # Statement EPS and analyst EPS are in the reporting currency and per local share, while the price is
+    # USD per ADR, so price/EPS was meaningless (TSM showed P/E 0.8). TTM P/E becomes USD market cap over
+    # TTM net income converted to USD (no ADR ratio needed); forward P/E keeps the TTM P/E and scales it by
+    # TTM EPS / NTM EPS, which is unit-free as long as both EPS series share a basis.
+    currency = income.get("currency") or "USD"
+    if currency != "USD":
+        fx = _fx_to_usd(currency)
+        ni = income.get("ttm_net_income")
+        pe_ttm = round(mkt_cap / (ni * fx), 1) if fx and ni and ni > 0 and mkt_cap else None
+        fwd_pe = None
+        if pe_ttm and income_eps and income_eps > 0 and fwd_eps and fwd_eps > 0:
+            ratio = income_eps / fwd_eps
+            if 0.2 <= ratio <= 5:             # different EPS bases → implausible ratio → leave blank
+                fwd_pe = round(pe_ttm * ratio, 1)
+        logger.info("[fx-pe] %s %s fx=%s ni=%s pe=%s fwd_pe=%s", symbol, currency, fx, ni, pe_ttm, fwd_pe)
+        trailing_eps = None                    # local-currency EPS is not comparable with the USD price
+        fwd_eps_out = None
+    else:
+        fwd_eps_out = fwd_eps
+
     # PEG: forward PE / n-year CAGR from NTM EPS base to terminal (quarter-based)
     # Fall back to FMP's own pegRatio when we lack enough forward quarters
     peg_result = _compute_peg(fwd_pe, fwd_eps, beyond_ntm, symbol=symbol)
@@ -580,7 +627,8 @@ def _fetch_all(symbol: str) -> dict:
         "op_delta":       income.get("op_delta"),
         "gm_delta":       income.get("gm_delta"),
         "ttm_eps":        trailing_eps,
-        "ntm_eps":        fwd_eps,
+        "ntm_eps":        fwd_eps_out,
+        "currency":       currency,
         "eps_growth_rate": (round(fwd_pe / (peg * 100), 6)
                             if peg and fwd_pe and peg > 0 and peg_method != "fmp"
                             else None),

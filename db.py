@@ -935,6 +935,48 @@ def get_political_trade_years() -> dict:
 
 # ── Earnings surprise functions ───────────────────────────────────────────────
 
+# An upcoming row is a projected report date. When the date moves (estimate 10-29 -> actual 11-02,
+# or NVDA 11-18 -> 11-17) FMP keys the new date as a new row and the old projection used to linger.
+# Report dates for consecutive quarters are ~90 days apart, so any other row within this window is
+# the same quarter.
+EARN_SAME_QTR_DAYS = 45
+
+
+def _days_apart(a: str, b: str) -> int:
+    try:
+        return abs((date.fromisoformat(a[:10]) - date.fromisoformat(b[:10])).days)
+    except Exception:
+        return 10 ** 6
+
+
+def drop_superseded_upcoming(rows: list) -> list:
+    """Read-side filter for one ticker's earnings rows (dicts with date/fiscal_end/is_upcoming/
+    eps_actual/rev_actual and optional fetched_at). Drops an upcoming row with no actuals when another
+    row for the same quarter exists: a reported row, or a newer projection. Pure; order preserved."""
+    def key(r):
+        return (r.get("fiscal_end") or r.get("date") or "")[:10]
+    out = []
+    for r in rows:
+        if r.get("is_upcoming") and r.get("eps_actual") is None and r.get("rev_actual") is None:
+            k = key(r)
+            superseded = False
+            for o in rows:
+                if o is r or _days_apart(key(o), k) > EARN_SAME_QTR_DAYS:
+                    continue
+                if not o.get("is_upcoming") or o.get("eps_actual") is not None or o.get("rev_actual") is not None:
+                    superseded = True          # the quarter has been reported
+                elif (o.get("fetched_at") or "") > (r.get("fetched_at") or ""):
+                    superseded = True          # a newer projection replaced this one
+                elif (o.get("fetched_at") or "") == (r.get("fetched_at") or "") and key(o) < k:
+                    superseded = True          # same fetch: keep the earlier date
+                if superseded:
+                    break
+            if superseded:
+                continue
+        out.append(r)
+    return out
+
+
 def upsert_earnings(ticker: str, rows: list) -> int:
     """
     Upsert earnings surprise rows for a ticker.
@@ -947,6 +989,8 @@ def upsert_earnings(ticker: str, rows: list) -> int:
         return 0
     session = _Session()
     inserted = updated = 0
+    # rows in this batch are never treated as stale for each other (the read side picks between them)
+    incoming = sorted({(r.get("fiscal_end") or "")[:10] for r in rows if (r.get("fiscal_end") or "")[:10]})
     try:
         for row in rows:
             fiscal_end = (row.get("fiscal_end") or "")[:10]
@@ -961,6 +1005,16 @@ def upsert_earnings(ticker: str, rows: list) -> int:
 
             ann_date = (row.get("date") or "")[:10]
             label    = _announced_to_calendar_label(ann_date) if not is_upcoming else None
+
+            # the same quarter under a different (projected) date is stale — remove it
+            for stale in session.query(EarningsSurprise).filter(
+                    EarningsSurprise.ticker == ticker.upper(),
+                    EarningsSurprise.fiscal_end.notin_(incoming),
+                    EarningsSurprise.is_upcoming == True,
+                    EarningsSurprise.eps_actual.is_(None),
+                    EarningsSurprise.rev_actual.is_(None)).all():
+                if _days_apart(stale.fiscal_end, fiscal_end) <= EARN_SAME_QTR_DAYS:
+                    session.delete(stale)
 
             if existing:
                 # A row is final only once BOTH actuals are stored. Until then
@@ -1091,7 +1145,11 @@ def get_earnings_db(tickers: list) -> dict:
                 "rev_actual":     r.rev_actual,
                 "rev_est":        r.rev_est,
                 "rev_surp":       r.rev_surp,
+                "fetched_at":     r.fetched_at.isoformat() if r.fetched_at else "",
             })
+        for t in result:
+            result[t] = [{k: v for k, v in x.items() if k != "fetched_at"}
+                         for x in drop_superseded_upcoming(result[t])]
         return result
     finally:
         session.close()

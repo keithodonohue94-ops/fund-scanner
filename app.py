@@ -673,6 +673,16 @@ def _ny_today() -> date:
     return datetime.now(ZoneInfo("America/New_York")).date()
 
 
+def _last_session_day() -> date:
+    """The trading day whose closing data a scan sees: today on a weekday, else the Friday before. A scan run
+    on a weekend (a manual /api/eod-run or a redeploy) was labelled with the weekend date — "Nov 15 close"
+    for Friday's chains."""
+    d = _ny_today()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
 def _run_technicals_eod():
     """
     Fetch technicals for every tracked ticker via Tradier and persist to DB by universe.
@@ -735,7 +745,7 @@ def _run_wing_eod():
     total_pairs   = 0
 
     logger.info("_run_wing_eod: scanning %d tickers via Tradier", len(all_tkrs))
-    trade_day = _ny_today()
+    trade_day = _last_session_day()
     iv_rows = []   # one ATM IV row per ticker for the iv_history table
     for ticker in all_tkrs:
         atm = {}
@@ -1438,6 +1448,14 @@ def get_political_trades():
     try:
         data = _db.get_political_trades(tickers=tickers, limit=limit,
                                         trade_year=trade_year, disc_year=disc_year)
+        try:
+            import legislators as _leg
+            _leg.fill_party(data)                     # disclosure feeds carry no party
+        except Exception as exc:
+            logger.warning("political-trades party fill: %s", exc)
+        for r in data:                                 # one spelling per trade type
+            if r.get("type") == "Sale Partial":
+                r["type"] = "Sale (Partial)"
         resp = jsonify({"results": data, "count": len(data)})
         resp.headers['Cache-Control'] = 'public, max-age=86400'
         return resp
