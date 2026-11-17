@@ -877,11 +877,13 @@ def upsert_political_trades(trades: list) -> int:
 
 
 def get_political_trades(tickers: set = None, since_date: str = None, limit: int = 2000,
-                         trade_year: str = None, disc_year: str = None) -> list:
+                         trade_year: str = None, disc_year: str = None, trade_since: str = None) -> list:
     """Query stored political trades, newest disc_date first."""
     session = _Session()
     try:
         q = session.query(PoliticalTrade).order_by(PoliticalTrade.disc_date.desc())
+        if trade_since:
+            q = q.filter(PoliticalTrade.trade_date >= trade_since)
         if tickers:
             q = q.filter(PoliticalTrade.ticker.in_(tickers))
         if since_date:

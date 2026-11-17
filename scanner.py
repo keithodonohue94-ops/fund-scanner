@@ -1141,6 +1141,30 @@ def fetch_political_trades_historical(from_date: str = "2025-01-01", to_date: st
     return results
 
 
+_BENCH_CACHE: dict = {}
+
+
+def benchmark_closes(symbol: str = "SPY", start: str = "2012-01-01") -> dict:
+    """{'YYYY-MM-DD': close} for a benchmark from FMP, cached 12h (politician track records vs the S&P)."""
+    import time as _time
+    from datetime import datetime as _dt
+    hit = _BENCH_CACHE.get(symbol)
+    if hit and _time.time() - hit[1] < 43200:
+        return hit[0]
+    data = _fmp_get(f"{FMP_STABLE}/historical-price-eod/full",
+                    {"symbol": symbol, "from": start, "to": _dt.utcnow().strftime("%Y-%m-%d")}) or []
+    if isinstance(data, dict):
+        data = data.get("historical") or data.get("data") or []
+    closes = {}
+    for h in data:
+        c = h.get("adjClose") or h.get("close")
+        if h.get("date") and c:
+            closes[h["date"][:10]] = float(c)
+    if closes:
+        _BENCH_CACHE[symbol] = (closes, _time.time())
+    return closes
+
+
 def fetch_forward_prices(trades: list, day_offsets: tuple = (30, 60)) -> list:
     """
     For each trade dict (must have 'ticker' and 'trade_date'), fetch the EOD

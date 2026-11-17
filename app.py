@@ -1450,12 +1450,9 @@ def get_political_trades():
                                         trade_year=trade_year, disc_year=disc_year)
         try:
             import legislators as _leg
-            _leg.fill_party(data)                     # disclosure feeds carry no party
+            data = _leg.clean_rows(data)               # party, one identity per member, duplicate sales removed
         except Exception as exc:
-            logger.warning("political-trades party fill: %s", exc)
-        for r in data:                                 # one spelling per trade type
-            if r.get("type") == "Sale Partial":
-                r["type"] = "Sale (Partial)"
+            logger.warning("political-trades clean: %s", exc)
         resp = jsonify({"results": data, "count": len(data)})
         resp.headers['Cache-Control'] = 'public, max-age=86400'
         return resp
@@ -1756,10 +1753,21 @@ def political_trades_leaderboard():
     Optional ?year=YYYY filters to trades in that calendar year only.
     """
     try:
-        year        = request.args.get("year", type=int)
-        leaderboard = _db.get_political_leaderboard(year=year)
+        year   = request.args.get("year", type=int)
+        months = request.args.get("months", default=24, type=int)
+        import legislators as _leg
+        import pol_perf as _pp
+        from scanner import benchmark_closes
+        since = None if year else (datetime.utcnow() - timedelta(days=int(months * 30.44))).strftime("%Y-%m-%d")
+        rows = _db.get_political_trades(limit=200000, trade_year=str(year) if year else None, trade_since=since)
+        rows = _leg.clean_rows(rows)
+        spy = benchmark_closes("SPY")
+        leaderboard = _pp.leaderboard(rows, spy, since=since, year=year) if spy else []
         counts      = _db.get_political_trades_count()
-        resp = jsonify({"status": "ok", "leaderboard": leaderboard, "year_filter": year, **counts})
+        resp = jsonify({"status": "ok" if spy else "no benchmark prices", "leaderboard": leaderboard,
+                        "year_filter": year, "window_months": None if year else months,
+                        "method": "direction-adjusted excess return vs SPY over 60 days (30 where 60 not yet available)",
+                        "min_trades": _pp.MIN_TRADES, **counts})
         resp.headers['Cache-Control'] = 'public, max-age=86400'
         return resp
     except Exception as exc:
